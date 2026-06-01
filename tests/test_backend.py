@@ -1636,3 +1636,99 @@ class TestStateExtract:
         lit[12:29, :, :] = 255                # fill the brick band
         bright = extract_breakout_state(lit)
         assert sum(bright["bricks"]) > sum(dark["bricks"])
+
+
+# ---------------------------------------------------------------------------
+# Temporal-stability feature ranking
+# ---------------------------------------------------------------------------
+
+class TestFeatureStability:
+    """Ranks features by ascending coefficient of variation over the recent window,
+    gating out dead features. Driven by hand-built history (no model needed)."""
+
+    @staticmethod
+    def _engine_with_history(rows):
+        from inference import InferenceEngine
+        engine = InferenceEngine(iris_src=str(_IRIS_SRC), iris_root=str(_IRIS_ROOT))
+        for r in rows:
+            engine._sae_history.append(np.array(r, dtype=np.float32))
+        return engine
+
+    def test_ranks_by_cv_and_gates_dead_features(self):
+        # cols: f0 constant (CV 0), f1 flickers (CV 0.5), f2 fires 1/3 (high CV),
+        #       f3 never fires (dead → must be excluded despite variance 0).
+        rows = [
+            [2, 1, 0, 0],
+            [2, 3, 0, 0],
+            [2, 1, 0, 0],
+            [2, 3, 2, 0],
+            [2, 1, 0, 0],
+            [2, 3, 2, 0],
+        ]
+        engine = self._engine_with_history(rows)
+        out = engine.get_feature_stability(top=10, min_firing=0.2)
+        assert out["available"] and out["window"] == 6
+        ids = [f["id"] for f in out["features"]]
+        assert 3 not in ids                      # dead feature gated out
+        assert ids == [0, 1, 2]                  # ascending CV
+        assert out["features"][0]["id"] == 0 and out["features"][0]["score"] == 1.0
+        assert out["features"][0]["firing_rate"] == 1.0
+
+    def test_min_firing_floor_excludes_rare_features(self):
+        rows = [[2, 1, 0, 0], [2, 3, 0, 0], [2, 1, 0, 0],
+                [2, 3, 2, 0], [2, 1, 0, 0], [2, 3, 2, 0]]
+        engine = self._engine_with_history(rows)
+        # f2 fires 2/6 ≈ 0.33; a 0.5 floor drops it.
+        ids = [f["id"] for f in engine.get_feature_stability(min_firing=0.5)["features"]]
+        assert ids == [0, 1]
+
+    def test_empty_window_unavailable(self):
+        from inference import InferenceEngine
+        engine = InferenceEngine(iris_src=str(_IRIS_SRC), iris_root=str(_IRIS_ROOT))
+        out = engine.get_feature_stability()
+        assert out["available"] is False and out["features"] == []
+
+
+# ---------------------------------------------------------------------------
+# Causal-importance ranking store + endpoint
+# ---------------------------------------------------------------------------
+
+class TestCausalRanking:
+
+    def test_store_ranks_descending(self, tmp_path):
+        from ranking_store import CausalRankingStore, resolve_causal_layer
+        store = CausalRankingStore(str(tmp_path), 5)
+        assert store.ranked()["available"] is False        # nothing written yet
+        store.save({
+            "layer": 5, "env_id": "Breakout", "n_steps": 20, "scale": 5.0, "seeds": 2,
+            "scores": {
+                "1": {"id": 1, "score": 0.5, "pos": 0.6, "neg": 0.4},
+                "2": {"id": 2, "score": 4.2, "pos": 5.0, "neg": 3.4},
+                "3": {"id": 3, "score": 1.1, "pos": 1.1, "neg": 1.1},
+            },
+        })
+        out = store.ranked(top=2)
+        assert out["available"] and out["n_features_scored"] == 3
+        assert [f["id"] for f in out["features"]] == [2, 3]   # descending score, top-2
+        assert resolve_causal_layer(str(tmp_path)) == 5       # single cache inferred
+
+    def test_endpoint(self, tmp_path, monkeypatch):
+        import importlib
+        monkeypatch.setenv("SAE_DIR", str(tmp_path))
+        monkeypatch.setenv("BOOKMARKS_PATH", str(tmp_path / "bm.json"))
+        monkeypatch.setenv("PINNED_PATH", str(tmp_path / "pinned.json"))
+        import main as main_mod
+        importlib.reload(main_mod)
+        from fastapi.testclient import TestClient
+        from ranking_store import CausalRankingStore
+
+        client = TestClient(main_mod.app, raise_server_exceptions=False)
+        # No cache → available false (not an error; the UI shows "run the pipeline").
+        assert client.get("/ranking/causal").json()["available"] is False
+
+        CausalRankingStore(str(tmp_path), 5).save({
+            "layer": 5, "scores": {"7": {"id": 7, "score": 3.0, "pos": 3.0, "neg": 3.0}}})
+        body = client.get("/ranking/causal").json()
+        assert body["available"] and body["features"][0]["id"] == 7
+
+        importlib.reload(main_mod)  # restore module for other tests

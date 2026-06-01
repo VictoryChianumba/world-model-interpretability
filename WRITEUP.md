@@ -126,6 +126,28 @@ Working hypothesis: temporal stability × causal importance, combined, will prod
 
 Plan: implement temporal stability as the immediate fix (small backend change, makes the discovery panel less churny). Implement causal importance as an offline pipeline (one rollout per feature, ~44 hours on CPU or ~22 on MPS, runs overnight). Surface both rankings as alternate views in the discovery panel. Document both as findings.
 
+### Implementation — temporal stability (done)
+
+Built as a small engine change: a rolling 60-frame window of the full per-feature activation vector (`_sae_history`, written each frame in `_compute_sae_features`), exposed via `GET /ranking/stability`. The discovery panel gained a metric toggle (`firing` / `stable` / `causal`), and "stable" polls the endpoint live (1.5s) so it reflects the recent window.
+
+**Design decision — rank by coefficient of variation, not raw variance.** The literal spec ("lower variance = higher rank") is degenerate: a permanently-OFF feature has variance 0 and would top the ranking while meaning nothing. Two changes fix it: (1) gate on a firing-rate floor (default 0.2) so features must actually fire in the window to be ranked, and (2) rank by ascending coefficient of variation (std/mean) rather than raw variance, which is scale-invariant — a feature that fires steadily at magnitude 0.5 and one that fires steadily at 3.0 are both "stable," and CV says so while raw variance would over-rank the small-magnitude one. The display score is `1/(1+CV)` so higher reads as more stable, matching the firing-magnitude bars' direction.
+
+This is the first concrete instance of the project's thesis: importing the LLM convention naively (rank by a magnitude statistic) produces a broken ranking on the world-model substrate, and the fix requires a substrate-aware metric. The dead-feature degeneracy is logged in FINDINGS.
+
+### Implementation — causal importance (done; partial sample measured)
+
+Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer}.json` → `GET /ranking/causal`, surfaced as the discovery panel's third toggle. For each feature it runs ±scale intervention rollouts against a shared baseline (same seed, same frozen action sequence) and scores by **mean token divergence** — token-only, no pixel decode, so it is far cheaper than the live `/rollout`. Injection is magnitude-relative (scale × the feature's own seed-state activation), matching the live intervention semantics. Built to sample and resume; `pos`/`neg` per-sign means are kept so an asymmetric feature is visible rather than averaged away.
+
+**Sample run — two independent runs, 24 most-active features, 2 seed states, 10 steps, ±5, MPS, ~9 min each:**
+
+- **Causal importance vs activation magnitude:** Spearman **+0.56** and **+0.64** across the two runs. Magnitude is a weak-to-moderate proxy for causal effect — within the *same* high-firing set, some features move the rollout hard (token divergence up to ~15 of 16) and others barely move it (~2 of 16). The single most-active feature (#1364) was also the most causal in both runs, but mid-ranking diverged. So magnitude predicts the very top but not the order.
+- **Run-to-run robustness:** the two runs shared only **18 of 30** distinct features — "top-K by activation" itself selected different features run-to-run (different seed states), the churn problem in another guise. On the shared set causal scores correlated at Spearman **+0.56**, with top-5 causal overlap **4/5**. The very top is reproducible; the tail is not from a single run.
+- **Sign asymmetry:** per-feature |effect(+5) − effect(−5)| averaged ~0.8 tokens — features respond asymmetrically to amplification vs suppression.
+
+**Caveat (scope, stated honestly):** this sample scores only the high-firing head (top-24 by activation), so the magnitude-vs-causal correlation is measured *within* active features and is biased **upward** — across all ~2K features, including the low-firing majority where the two diverge most, agreement would be lower. The sample is enough to show the pipeline works and that magnitude is an imperfect proxy even among active features; it is not the full-feature result. The full run (all features, more seeds) is the next step. Per single-measurement discipline, every number here is from a 2-run / 2-seed sample and should be read as provisional beyond the top handful.
+
+**Which ranking is "more interpretable"?** Not yet answerable on this evidence — it needs the autointerp labels (also built, not yet run) so a human can read the top features of each ranking side by side. What the sample *does* show: the three rankings genuinely disagree (firing is unstable frame-to-frame and run-to-run; causal only moderately tracks magnitude), so they are not redundant views — picking the ranking is a real choice, which is why all three are exposed.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.

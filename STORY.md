@@ -38,7 +38,12 @@ Redesigned around an EffectVis-style canvas with pinned feature cards, search-ba
 
 Top-K-by-activation-magnitude is the LLM SAE convention but doesn't transfer cleanly to world models, where frames are highly correlated and the underlying state changes slowly. The right notion of "feature importance" for world models is an open question and the current research direction.
 
-Working hypothesis: temporal stability (features that fire consistently across many frames) combined with causal importance (features whose intervention measurably changes rollouts) is a better signal than raw magnitude. Implementing both is the next phase. Documenting them is the research output.
+Working hypothesis: temporal stability (features that fire consistently across many frames) combined with causal importance (features whose intervention measurably changes rollouts) is a better signal than raw magnitude. Both are now implemented as alternate rankings in the discovery panel, alongside the original firing ranking. Each produced a finding the moment it ran:
+
+- **Temporal stability** — ranking by raw variance is degenerate (dead features have zero variance and look "perfectly stable"), so the metric needs a firing-rate gate and a scale-invariant coefficient of variation.
+- **Causal importance** — a partial two-run sample showed magnitude only moderately predicts causal effect (Spearman ~0.56–0.64), even among already-active features, and that a single causal run is noisy (independent runs agreed at Spearman ~0.56, with only the top handful reproducible). The three rankings genuinely disagree, so they are not redundant — choosing one is a real decision.
+
+Which ranking yields the most *interpretable* features is still open: it waits on the autointerp labels (built, not yet run) so the top of each ranking can be read side by side. Documenting the rankings — and their disagreement — is the research output.
 
 ## Where this sits
 

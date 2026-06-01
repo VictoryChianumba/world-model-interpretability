@@ -28,6 +28,23 @@ Better candidates: temporal stability (features that fire consistently across ma
 
 **Implication:** importing LLM SAE conventions directly into world model interpretability tooling produces broken UX. Importance metrics need to be adapted to the substrate.
 
+### Edge case — "rank by low firing-rate variance" is degenerate without a firing-rate floor
+
+When implementing temporal-stability ranking (rank features that fire consistently above features that flicker), the obvious metric — lowest variance of activation over a window — is degenerate. A permanently-OFF feature has variance exactly 0, so a naive low-variance ranking surfaces dead features at the top: maximally "stable," entirely meaningless. SAEs have many dead/rare features, so this isn't a corner case; it dominates the ranking.
+
+Two fixes, both needed: (1) gate candidates on a firing-rate floor (a feature must be active in at least X% of the window, default 20%, to be ranked at all), and (2) rank by coefficient of variation (std/mean) rather than raw variance. CV is scale-invariant, so a feature firing steadily at low magnitude and one firing steadily at high magnitude are scored equally stable — whereas raw variance conflates "low magnitude" with "stable" and over-ranks weak features.
+
+**Implication:** any "consistency" or "stability" importance metric on a sparse-feature substrate needs an activity gate, because the silent majority of features are inactive and inactivity reads as perfect stability. State the gate explicitly; it changes which features the ranking is even considering.
+
+### Causal importance only moderately tracks activation magnitude — and a single causal run is noisy
+
+Two independent partial runs of causal-importance scoring (mean token divergence under ±5 intervention rollouts; 24 most-active features; 2 seed states each) on Breakout layer 5:
+
+- **Causal vs magnitude:** Spearman +0.56 and +0.64. Activation magnitude is a weak-to-moderate predictor of causal effect even *restricted to high-firing features* — the firing head contains both high-impact and near-inert features (token divergence ranged ~2 to ~15 of 16). The single most-active feature was also the most causal in both runs, so magnitude predicts the very top but not the ordering below it.
+- **Run-to-run robustness:** the two runs shared only 18 of 30 distinct features (top-K-by-activation selected different features run-to-run — the same churn that breaks the live "firing" ranking, now visible across runs). On the shared set, causal scores correlated at Spearman +0.56 with top-5 overlap 4/5. The top handful is reproducible; the rest is not from a single run.
+
+**Implication:** causal importance is the most defensible ranking but the most expensive to estimate reliably. A single seed state or single run gives a trustworthy *top few* and an untrustworthy tail. Use ≥2 seed states (the pipeline default) and compare ≥2 runs before believing any mid-ranking ordering. And measuring magnitude-vs-causal agreement *only* on the top-K-by-activation set biases the correlation upward — the low-firing majority, where the two diverge most, is excluded; the honest comparison needs the full-feature run. This is the single-measurement discipline applied to a ranking rather than a scalar: the conclusion "feature X is more important than feature Y" needs more than one measurement, and how much more depends on how close X and Y are.
+
 ## Soft routing in MoE-style SAEs leaks signal into the gating mechanism
 
 *(Carried from the previous factored-SAE project; relevant context here.)*

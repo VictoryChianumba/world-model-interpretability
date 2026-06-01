@@ -1,40 +1,83 @@
 "use client";
 
-import type { SAEFeature } from "@/hooks/useVisualizerSocket";
+import type { RankedFeature, RankingMetric } from "@/hooks/useFeatureRanking";
 
 interface Props {
-  features: SAEFeature[] | null;
+  metric: RankingMetric;
+  onMetricChange: (m: RankingMetric) => void;
+  items: RankedFeature[];
+  available: boolean;
+  note?: string;
   labelFor: (featureId: number) => string | null;
   onPin: (featureId: number) => void;
   isPinned: (featureId: number) => boolean;
   paused: boolean;
 }
 
+const METRICS: { key: RankingMetric; label: string; title: string }[] = [
+  { key: "firing", label: "firing", title: "Top-K by current activation magnitude (LLM-SAE convention; churns frame-to-frame)" },
+  { key: "stability", label: "stable", title: "Fires consistently across the recent window (low coefficient of variation)" },
+  { key: "causal", label: "causal", title: "Offline: intervention's mean token-divergence effect on rollouts" },
+];
+
 /**
- * DiscoveryPanel — the top-firing features for the current frame.
+ * DiscoveryPanel — find candidate features to pin, under a switchable ranking.
  *
- * This is where you find candidates, not the main interaction surface: it refreshes as the
- * paused frame changes and a click pins a feature onto the canvas (the real workspace). The
- * list is the live top-K from the socket, annotated with autointerp labels where available.
+ * The metric toggle is the substrate-adaptation experiment made visible: "firing" is the
+ * borrowed LLM convention (and visibly churns); "stable" and "causal" are the world-model
+ * alternatives. Clicking a row pins it to the canvas (the real workspace). Score bars are
+ * normalized within the current ranking.
  */
-export default function DiscoveryPanel({ features, labelFor, onPin, isPinned, paused }: Props) {
-  const max = features && features.length ? Math.max(...features.map((f) => f.mag)) : 1;
+export default function DiscoveryPanel({
+  metric,
+  onMetricChange,
+  items,
+  available,
+  note,
+  labelFor,
+  onPin,
+  isPinned,
+  paused,
+}: Props) {
+  const max = items.length ? Math.max(...items.map((i) => i.score), 1e-6) : 1;
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-slate-800 px-3 py-2">
         <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-          Top firing
+          Discover
         </span>
-        <span className="text-[10px] text-slate-500">{paused ? "paused" : "live"}</span>
+        <span className="text-[10px] text-slate-500">
+          {metric === "firing" ? (paused ? "paused" : "live") : metric === "stability" ? "window" : "offline"}
+        </span>
       </div>
+
+      {/* Ranking toggle */}
+      <div className="flex gap-0.5 border-b border-slate-800 px-2 py-1.5">
+        {METRICS.map((m) => (
+          <button
+            key={m.key}
+            title={m.title}
+            onClick={() => onMetricChange(m.key)}
+            className={`flex-1 rounded px-1.5 py-0.5 text-[10px] capitalize ${
+              metric === m.key ? "bg-indigo-600 text-white" : "bg-slate-800 text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+
       <div className="flex-1 overflow-auto">
-        {!features?.length && (
+        {!available && (
           <div className="px-3 py-4 text-xs text-slate-500">
-            No SAE features (load an agent with a trained SAE).
+            {note ?? "No data for this ranking yet."}
           </div>
         )}
-        {features?.map((f) => {
+        {available && items.length === 0 && (
+          <div className="px-3 py-4 text-xs text-slate-500">No features pass this ranking.</div>
+        )}
+        {items.map((f) => {
           const label = labelFor(f.id);
           const pinned = isPinned(f.id);
           return (
@@ -55,7 +98,7 @@ export default function DiscoveryPanel({ features, labelFor, onPin, isPinned, pa
                   </span>
                 </span>
                 <span className="ml-2 flex-shrink-0 font-mono text-[10px] text-slate-400">
-                  {f.mag.toFixed(2)}
+                  {f.score.toFixed(2)}
                   <span className="ml-1 text-indigo-400 opacity-0 group-hover:opacity-100">
                     {pinned ? "" : "+pin"}
                   </span>
@@ -64,9 +107,10 @@ export default function DiscoveryPanel({ features, labelFor, onPin, isPinned, pa
               <div className="h-1 w-full rounded bg-slate-800">
                 <div
                   className="h-1 rounded bg-indigo-500"
-                  style={{ width: `${Math.min(100, (f.mag / max) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (f.score / max) * 100)}%` }}
                 />
               </div>
+              {f.detail && <span className="text-[9px] text-slate-500">{f.detail}</span>}
             </button>
           );
         })}

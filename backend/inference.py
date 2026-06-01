@@ -509,6 +509,12 @@ class InferenceEngine:
         self._sae_last_feats: Optional[torch.Tensor] = None
         # Floor activation so an off (zero) feature can still be driven by the slider.
         self._sae_mag_floor = 1.0
+        # Rolling window of recent full feature vectors (each d_hidden,) for the
+        # temporal-stability ranking. Written by _compute_sae_features (inference thread),
+        # read by get_feature_stability (request thread) under its own lock.
+        self._sae_history_window = 60
+        self._sae_history: deque = deque(maxlen=self._sae_history_window)
+        self._sae_history_lock = threading.Lock()
 
         # Serialises all world-model forward passes: the live loop holds it for its
         # per-frame WM forward, and run_rollout() holds it for the whole N-step
@@ -563,6 +569,8 @@ class InferenceEngine:
             self._iv_feature_id = None
             self._iv_scale = 0.0
         self._sae_last_feats = None
+        with self._sae_history_lock:
+            self._sae_history.clear()  # stability window is per-agent
 
         logger.info("Loading agent from %s (env=%s, device=%s)", checkpoint_path, env_id, device_str)
         try:
@@ -910,6 +918,53 @@ class InferenceEngine:
         """WM layer the loaded SAE reads, or None if no SAE is loaded."""
         return self._sae_layer
 
+    def get_feature_stability(self, top: int = 20, min_firing: float = 0.2) -> dict:
+        """Rank SAE features by temporal stability over the recent frame window.
+
+        For each feature, take its post-ReLU activation across the last ``window`` frames
+        and compute firing_rate (fraction of frames active), mean, and variance. The
+        ranking is **ascending coefficient of variation** (std/mean) among features that
+        fire in at least ``min_firing`` of the window — low CV means the feature fires
+        consistently rather than flickering.
+
+        The ``min_firing`` gate is essential, not cosmetic: a permanently-OFF feature has
+        variance 0 (and so looks perfectly "stable") but is meaningless, so ranking by raw
+        low variance is degenerate and surfaces dead features. CV (scale-invariant) plus a
+        firing-rate floor is the honest version. ``available`` is False until the window
+        has frames (e.g. right after an agent switch).
+        """
+        with self._sae_history_lock:
+            if not self._sae_history:
+                return {"metric": "stability", "available": False, "window": 0, "features": []}
+            arr = np.stack(list(self._sae_history))  # (W, d_hidden)
+        W = arr.shape[0]
+        firing = (arr > 0.0).mean(axis=0)
+        mean = arr.mean(axis=0)
+        var = arr.var(axis=0)
+        cv = np.sqrt(var) / (mean + 1e-6)
+        gated = np.where(firing >= min_firing)[0]
+        order = gated[np.argsort(cv[gated])][:top]
+        features = [
+            {
+                "id": int(i),
+                # Display score: higher = more stable (1/(1+CV)), so the panel's bars read
+                # the same direction as the firing-magnitude bars.
+                "score": round(float(1.0 / (1.0 + cv[i])), 4),
+                "firing_rate": round(float(firing[i]), 4),
+                "mean_activation": round(float(mean[i]), 4),
+                "variance": round(float(var[i]), 4),
+                "cv": round(float(cv[i]), 4),
+            }
+            for i in order
+        ]
+        return {
+            "metric": "stability",
+            "available": True,
+            "window": int(W),
+            "min_firing": float(min_firing),
+            "features": features,
+        }
+
     def get_config(self) -> dict:
         """Current model config (returns empty dict if no agent loaded)."""
         if self._agent is None:
@@ -986,6 +1041,9 @@ class InferenceEngine:
                 x = (resid[0, -1] - self._sae_norm_mean) / self._sae_norm_std   # (E,)
                 feats = self._sae.encode(x.unsqueeze(0)).squeeze(0)             # (d_hidden,)
                 self._sae_last_feats = feats.detach()  # for magnitude-relative interventions
+                # Snapshot the full vector into the stability window (cheap: ~2K floats).
+                with self._sae_history_lock:
+                    self._sae_history.append(feats.detach().cpu().numpy())
                 k = min(self._sae_topk, feats.numel())
                 vals, idx = torch.topk(feats, k)
                 return [
