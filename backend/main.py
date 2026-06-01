@@ -201,6 +201,38 @@ async def control(cmd: ControlCommand) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Intervention rollout (paused-only, on-demand N-step experiment)
+# ---------------------------------------------------------------------------
+
+class RolloutCommand(BaseModel):
+    feature_id: int
+    scale: float
+    n_steps: int = 20
+    n_seeds: int = 2
+
+
+@app.post("/rollout")
+async def run_rollout(cmd: RolloutCommand) -> dict:
+    """Run paired baseline vs intervened N-step imagined rollouts from the current frame.
+
+    Heavy (~n_seeds * 2 * n_steps * 17 WM passes) and paused-only — runs off the event
+    loop in a thread. Returns frames + Breakout state per step for both conditions.
+    """
+    from fastapi import HTTPException
+    loop = asyncio.get_event_loop()
+    # Clamp to sane bounds (cost grows linearly in both).
+    n_steps = max(1, min(int(cmd.n_steps), 40))
+    n_seeds = max(1, min(int(cmd.n_seeds), 4))
+    try:
+        result = await loop.run_in_executor(
+            None, engine.run_rollout, int(cmd.feature_id), float(cmd.scale), n_steps, n_seeds
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Bookmarks (SAE feature labels — the only persisted state)
 # ---------------------------------------------------------------------------
 

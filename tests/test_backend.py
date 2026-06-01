@@ -1308,3 +1308,155 @@ class TestBookmarkStore:
         assert client.get("/bookmarks").json() == []
 
         importlib.reload(main_mod)  # restore module for other tests
+
+
+# ---------------------------------------------------------------------------
+# N-step rollout
+# ---------------------------------------------------------------------------
+
+class TestRollout:
+
+    def test_hook_fires_on_every_pass(self):
+        """Persistent intervention hook fires on all (1+K)*N passes of an N-step rollout."""
+        from inference import _rollout
+        torch.manual_seed(0)
+        wm = make_world_model(num_layers=3, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        K = 4
+        init = torch.randint(0, 16, (1, K))
+        n_steps = 6
+        device = torch.device("cpu")
+
+        calls = {"n": 0}
+        # Count fires by registering our own counting hook on the SAME block the
+        # rollout intervenes on; the rollout's iv_hook and this counter coexist.
+        h = wm.transformer.blocks[1].register_forward_hook(
+            lambda m, i, o: calls.__setitem__("n", calls["n"] + 1)
+        )
+        try:
+            _rollout(wm, tokenizer, init, [0] * n_steps, device,
+                     intervention=(1, torch.zeros(16)), seed=0)
+        finally:
+            h.remove()
+        # 1 priming pass + N steps * (1 action + K obs) passes.
+        assert calls["n"] == 1 + n_steps * (1 + K)
+
+    def test_rollout_hook_removed_after(self):
+        """The intervention hook does not persist on the model after the rollout."""
+        from inference import _rollout
+        wm = make_world_model(num_layers=3, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        init = torch.randint(0, 16, (1, 4))
+        before = sum(len(m._forward_hooks) for m in wm.modules())
+        _rollout(wm, tokenizer, init, [0, 0, 0], torch.device("cpu"),
+                 intervention=(1, torch.randn(16)), seed=0)
+        after = sum(len(m._forward_hooks) for m in wm.modules())
+        assert after == before
+
+    def test_rollout_seeded_reproducible(self):
+        """Same seed + same actions → identical token sequence (paired runs are comparable)."""
+        from inference import _rollout
+        wm = make_world_model(num_layers=3, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        init = torch.randint(0, 16, (1, 4))
+        actions = [0, 1, 0, 1, 0]
+        a = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=7)
+        b = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=7)
+        assert len(a) == len(b) == len(actions)
+        for ta, tb in zip(a, b):
+            assert torch.equal(ta, tb)
+
+    def test_zero_direction_matches_baseline(self):
+        """A zero intervention direction reproduces the baseline exactly (same seed)."""
+        from inference import _rollout
+        wm = make_world_model(num_layers=3, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        init = torch.randint(0, 16, (1, 4))
+        actions = [0, 1, 0]
+        base = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=3)
+        zero = _rollout(wm, tokenizer, init, actions, torch.device("cpu"),
+                        intervention=(1, torch.zeros(16)), seed=3)
+        for tb, tz in zip(base, zero):
+            assert torch.equal(tb, tz)
+
+    def test_rollout_length_and_shapes(self):
+        """Returns one (1, K) token tensor per action."""
+        from inference import _rollout
+        wm = make_world_model(num_layers=2, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        init = torch.randint(0, 16, (1, 4))
+        out = _rollout(wm, tokenizer, init, [0] * 8, torch.device("cpu"), seed=0)
+        assert len(out) == 8
+        for t in out:
+            assert t.shape == (1, 4)
+
+    def test_token_divergence_metric(self):
+        """Per-step token-divergence counts differing obs tokens, bounded by K.
+
+        Paired-identical runs (same seed, zero/no intervention) → 0 every step; two
+        DIFFERENT seeds → some nonzero, K-bounded divergence. (We verify the metric
+        here, not the toy model's intervention sensitivity — a constant residual offset
+        is largely laundered by downstream LayerNorms in a tiny random model, so
+        "large intervention flips tokens" is verified live on the real model instead.)"""
+        from inference import _rollout
+        wm = make_world_model(num_layers=3, num_heads=2, embed_dim=16, tokens_per_block=5)
+        tokenizer = TestReconstructionDecode._make_tokenizer_stub(vocab_size=16, embed_dim=8, out_hw=8)
+        init = torch.randint(0, 16, (1, 4))
+        actions = [0, 1, 0, 1]
+        K = 4
+
+        base = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=1)
+        zero = _rollout(wm, tokenizer, init, actions, torch.device("cpu"),
+                        intervention=(1, torch.zeros(16)), seed=1)
+        same = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=1)
+        # Paired identical conditions → zero divergence every step.
+        assert [int((b != z).sum()) for b, z in zip(base, zero)] == [0] * len(actions)
+        assert [int((b != s).sum()) for b, s in zip(base, same)] == [0] * len(actions)
+
+        # A different seed yields a valid, K-bounded divergence series with some signal.
+        other = _rollout(wm, tokenizer, init, actions, torch.device("cpu"), seed=2)
+        div = [int((b != o).sum()) for b, o in zip(base, other)]
+        assert all(0 <= d <= K for d in div)
+        assert max(div) > 0
+
+
+# ---------------------------------------------------------------------------
+# Breakout state extraction (Breakout-specific hack on 64x64 frames)
+# ---------------------------------------------------------------------------
+
+class TestStateExtract:
+
+    def test_paddle_centroid(self):
+        """A bright horizontal bar in the bottom band → paddle_x near its centre."""
+        from state_extract import extract_breakout_state
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        frame[58:61, 40:50, :] = 255          # paddle near right-of-centre
+        st = extract_breakout_state(frame)
+        assert st["paddle_x"] is not None
+        assert 0.65 < st["paddle_x"] < 0.78   # centre of cols 40..50 ≈ 44.5/63 ≈ 0.706
+
+    def test_ball_centroid(self):
+        """A bright dot in the play area → ball_x/ball_y near its position."""
+        from state_extract import extract_breakout_state
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        frame[32:34, 20:22, :] = 255
+        st = extract_breakout_state(frame)
+        assert st["ball_x"] is not None and st["ball_y"] is not None
+        assert 0.28 < st["ball_x"] < 0.38     # cols ~20.5/63 ≈ 0.325
+        assert 0.46 < st["ball_y"] < 0.56     # rows ~32.5/63 ≈ 0.516
+
+    def test_empty_frame_returns_none(self):
+        """A blank frame yields no paddle/ball but a length-6 bricks vector."""
+        from state_extract import extract_breakout_state
+        st = extract_breakout_state(np.zeros((64, 64, 3), dtype=np.uint8))
+        assert st["paddle_x"] is None and st["ball_x"] is None and st["ball_y"] is None
+        assert isinstance(st["bricks"], list) and len(st["bricks"]) == 6
+
+    def test_bricks_reflect_brightness(self):
+        """Brick-row brightness tracks how much of the brick band is lit."""
+        from state_extract import extract_breakout_state
+        dark = extract_breakout_state(np.zeros((64, 64, 3), dtype=np.uint8))
+        lit = np.zeros((64, 64, 3), dtype=np.uint8)
+        lit[12:29, :, :] = 255                # fill the brick band
+        bright = extract_breakout_state(lit)
+        assert sum(bright["bricks"]) > sum(dark["bricks"])

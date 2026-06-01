@@ -315,6 +315,74 @@ def _abs_diff_gray_png(a: np.ndarray, b: np.ndarray) -> Optional[str]:
         return None
 
 
+@torch.no_grad()
+def _rollout(
+    wm,
+    tokenizer,
+    init_obs_tokens: "torch.Tensor",     # (1, K) long — seed observation, on device
+    actions: List[int],                  # one action per step (len = n_steps)
+    device: "torch.device",
+    intervention: Optional[Tuple[int, "torch.Tensor"]] = None,  # (layer, raw direction (E,))
+    seed: int = 0,
+) -> List["torch.Tensor"]:
+    """Roll the world model forward N steps from a seed observation; return per-step tokens.
+
+    Mirrors IRIS WorldModelEnv multi-step imagination (envs/world_model_env.py):
+    prime one KV cache with the seed obs tokens, then for each step feed that step's
+    action token and autoregressively sample K next-obs tokens, carrying the SAME cache
+    across all steps (refreshing it from the latest obs tokens when it would overflow
+    ``max_tokens``).  Next-obs tokens are SAMPLED (Categorical) under a fixed per-rollout
+    seed, so baseline and intervened runs with the same seed + same actions differ ONLY
+    by the intervention.
+
+    The intervention hook is registered ONCE on ``blocks[layer]`` before the loop, so it
+    fires on every one of the ~17*N forward passes automatically (module hooks persist) —
+    not one-shot.  Removed in ``finally``.
+
+    Returns a list of length ``len(actions)`` of (1, K) long token tensors — the imagined
+    observation at each step.  Decoding to pixels is left to the caller.
+    """
+    handle = None
+    try:
+        if intervention is not None:
+            iv_layer, iv_dir = intervention
+
+            def iv_hook(_mod, _inp, out):
+                return out + iv_dir          # all token positions (broadcasts over T)
+
+            handle = wm.transformer.blocks[iv_layer].register_forward_hook(iv_hook)
+
+        torch.manual_seed(seed)
+        K = init_obs_tokens.shape[1]
+        max_tokens = wm.config.max_tokens
+        kv = wm.transformer.generate_empty_keys_values(n=1, max_tokens=max_tokens)
+        wm(init_obs_tokens, past_keys_values=kv)     # prime cache (hook active if intervening)
+        obs_tokens = init_obs_tokens
+
+        per_step: List[torch.Tensor] = []
+        for action_int in actions:
+            num_passes = 1 + K
+            # Refresh the cache from the current obs if this step would overflow it
+            # (matches world_model_env.py:63 — keeps a bounded, valid context window).
+            if kv.size + num_passes > max_tokens:
+                kv = wm.transformer.generate_empty_keys_values(n=1, max_tokens=max_tokens)
+                wm(obs_tokens, past_keys_values=kv)
+
+            token = torch.tensor([[action_int]], dtype=torch.long, device=device)  # (1, 1)
+            gen: List[torch.Tensor] = []
+            for k in range(num_passes):          # 1 action pass + K obs-token passes
+                out = wm(token, past_keys_values=kv)
+                if k < K:
+                    token = Categorical(logits=out.logits_observations).sample()  # (1, 1)
+                    gen.append(token)
+            obs_tokens = torch.cat(gen, dim=1)   # (1, K) — feeds the next step
+            per_step.append(obs_tokens)
+        return per_step
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
 # ---------------------------------------------------------------------------
 # Agent loader
 # ---------------------------------------------------------------------------
@@ -441,6 +509,13 @@ class InferenceEngine:
         self._sae_last_feats: Optional[torch.Tensor] = None
         # Floor activation so an off (zero) feature can still be driven by the slider.
         self._sae_mag_floor = 1.0
+
+        # Serialises all world-model forward passes: the live loop holds it for its
+        # per-frame WM forward, and run_rollout() holds it for the whole N-step
+        # rollout, so an on-demand rollout (paused) never races the loop's wm() calls.
+        self._wm_lock = threading.Lock()
+        # Latest frame's encoded obs tokens (1, K), the seed state for a rollout.
+        self._last_obs_tokens: Optional[torch.Tensor] = None
 
         # Counters (written only from inference thread)
         self._step_count = 0
@@ -588,6 +663,165 @@ class InferenceEngine:
         with self._iv_lock:
             self._iv_feature_id = feature_id
             self._iv_scale = float(scale)
+
+    def run_rollout(
+        self,
+        feature_id: int,
+        scale: float,
+        n_steps: int = 20,
+        n_seeds: int = 2,
+    ) -> dict:
+        """Run paired baseline vs intervened N-step imagined rollouts from the current frame.
+
+        The experiment the tool exists for: does scaling SAE feature ``feature_id`` in the
+        WM residual stream change the *dynamics* of an imagined rollout (not just one frame).
+
+        Design (all confirmed with the user):
+          - Intervention applied AS-IS via ``_intervention_direction`` (the current merged
+            all-positions, magnitude-relative injection — this method is unchanged here).
+          - A single ACTION SEQUENCE is chosen once on a reference baseline rollout, frozen,
+            and replayed IDENTICALLY in every seed/condition — so any trajectory divergence is
+            attributable to the intervention, not to different action choices.
+          - ``n_seeds`` paired runs per condition (baseline seed s ↔ intervened seed s, same
+            actions) so seed-averaging guards against a lone stochastic-sampling fluke.
+
+        Cost ≈ n_seeds * 2 * n_steps * (1+K) WM passes (~2.7k for 20×2) — paused-only; the
+        caller must run this off the event loop. Holds ``_wm_lock`` for the whole rollout so it
+        never races the live loop's WM forward.
+
+        Returns a JSON-able dict (see keys below); frames are base64 PNGs of the 64×64 decode.
+        Raises RuntimeError if no SAE is loaded, no seed frame is available, or not paused.
+        """
+        from state_extract import extract_breakout_state
+
+        if self._sae is None or self._sae_layer is None:
+            raise RuntimeError("No SAE loaded — cannot run an intervention rollout")
+        if not self.is_running:
+            raise RuntimeError("Engine not running")
+        if self._pause_event.is_set():
+            raise RuntimeError("Rollout is paused-only — pause the loop first")
+
+        agent = self._agent
+        wm = agent.world_model
+        tokenizer = agent.tokenizer
+        device = agent.device
+        layer = self._sae_layer
+
+        with self._wm_lock:
+            init = self._last_obs_tokens
+            if init is None:
+                raise RuntimeError("No seed frame yet — step at least once before a rollout")
+            init = init.to(device)
+
+            iv_dir = self._intervention_direction(feature_id, scale)
+            if iv_dir is None:
+                raise RuntimeError("Intervention direction unavailable (bad feature_id or scale 0)")
+
+            # --- Fixed action sequence: chosen once on a reference baseline, then frozen ---
+            actions = self._rollout_actions(wm, tokenizer, init, device, n_steps, seed=0)
+
+            target_hw = (64, 64)  # decode native size; Breakout state-extract expects 64×64
+
+            def run(intervention):
+                # Returns (json_frames[seed][step], rgb[seed][step], tokens[seed][step]).
+                seeds_json, seeds_rgb, seeds_tok = [], [], []
+                for s in range(n_seeds):
+                    toks = _rollout(wm, tokenizer, init, actions, device,
+                                    intervention=intervention, seed=s)
+                    frames, rgbs = [], []
+                    for t in toks:
+                        rgb = _rec_tensor_to_rgb(
+                            _decode_obs_tokens_to_pixels(tokenizer, t), target_hw
+                        )
+                        rgbs.append(rgb)
+                        frames.append({
+                            "frame": _encode_frame(rgb),
+                            "state": extract_breakout_state(rgb),
+                        })
+                    seeds_json.append(frames)
+                    seeds_rgb.append(rgbs)
+                    seeds_tok.append(toks)
+                return seeds_json, seeds_rgb, seeds_tok
+
+            baseline, base_rgb, base_tok = run(None)
+            intervened, iv_rgb, iv_tok = run((layer, iv_dir))
+
+            # --- Divergence trajectories (robust signal even when pixel state-extract
+            # fails on lossy frames): per step, averaged over paired seeds ---
+            #   token_divergence: # of the K obs tokens that differ baseline↔intervened (0..K)
+            #   pixel_divergence: mean abs pixel diff baseline↔intervened (0..255)
+            K = init.shape[1]
+            token_div, pixel_div = [], []
+            for step in range(n_steps):
+                td, pd = [], []
+                for s in range(n_seeds):
+                    td.append(int((base_tok[s][step] != iv_tok[s][step]).sum().item()))
+                    pd.append(float(np.abs(
+                        base_rgb[s][step].astype(np.int16) - iv_rgb[s][step].astype(np.int16)
+                    ).mean()))
+                token_div.append(round(sum(td) / len(td), 3))
+                pixel_div.append(round(sum(pd) / len(pd), 3))
+
+        return {
+            "feature_id": int(feature_id),
+            "scale": float(scale),
+            "layer": int(layer),
+            "n_steps": int(n_steps),
+            "n_seeds": int(n_seeds),
+            "n_obs_tokens": int(K),
+            "actions": [int(a) for a in actions],
+            "baseline": baseline,       # [seed][step] -> {frame, state}
+            "intervened": intervened,
+            # per-step, seed-averaged divergence between conditions:
+            "token_divergence": token_div,   # 0..K obs tokens changed
+            "pixel_divergence": pixel_div,   # 0..255 mean abs pixel diff
+        }
+
+    @torch.no_grad()
+    def _rollout_actions(self, wm, tokenizer, init_obs_tokens, device, n_steps, seed=0):
+        """Generate the fixed action sequence via ONE coherent reference rollout.
+
+        At each step the policy acts on the *current* imagined frame to pick that step's
+        action, then the WM steps forward with it — so the (action, frame) sequence is
+        self-consistent. The resulting actions are frozen and replayed identically in every
+        seed/condition run, isolating the intervention's effect from action choices.
+
+        Falls back to NOOP (action 0) for every step if policy-on-imagined misbehaves —
+        acting on lossy imagined frames is off-distribution for the actor-critic, but a
+        fixed all-NOOP sequence is still a valid controlled comparison.
+        """
+        agent = self._agent
+        try:
+            torch.manual_seed(seed)
+            K = init_obs_tokens.shape[1]
+            max_tokens = wm.config.max_tokens
+            kv = wm.transformer.generate_empty_keys_values(n=1, max_tokens=max_tokens)
+            wm(init_obs_tokens, past_keys_values=kv)
+            obs_tokens = init_obs_tokens
+            agent.actor_critic.reset(n=1)
+
+            actions: List[int] = []
+            for _ in range(n_steps):
+                rec = _decode_obs_tokens_to_pixels(tokenizer, obs_tokens)  # (1,C,H,W) [0,1]
+                a = int(agent.act(rec, should_sample=False).item())
+                actions.append(a)
+
+                num_passes = 1 + K
+                if kv.size + num_passes > max_tokens:
+                    kv = wm.transformer.generate_empty_keys_values(n=1, max_tokens=max_tokens)
+                    wm(obs_tokens, past_keys_values=kv)
+                token = torch.tensor([[a]], dtype=torch.long, device=device)
+                gen: List[torch.Tensor] = []
+                for k in range(num_passes):
+                    out = wm(token, past_keys_values=kv)
+                    if k < K:
+                        token = Categorical(logits=out.logits_observations).sample()
+                        gen.append(token)
+                obs_tokens = torch.cat(gen, dim=1)
+            return actions
+        except Exception as exc:
+            logger.warning("Policy-on-imagined action gen failed (%s); using all-NOOP", exc)
+            return [0] * n_steps
 
     def restart_episode(self) -> None:
         self._reset_requested.set()
@@ -855,7 +1089,7 @@ class InferenceEngine:
             attn_data: Optional[Dict[int, torch.Tensor]] = None
             norms_data: Optional[Dict[int, torch.Tensor]] = None  # 0-d tensors
             try:
-                with torch.no_grad():
+                with torch.no_grad(), self._wm_lock:
                     enc_out = tokenizer.encode(obs_tensor, should_preprocess=True)
                     obs_tokens_enc = enc_out.tokens  # (1, K=16)
                     act_tensor = torch.tensor(
@@ -864,6 +1098,7 @@ class InferenceEngine:
                     tokens = torch.cat([obs_tokens_enc, act_tensor], dim=1)  # (1, 17)
                     wm(tokens, past_keys_values=None)
                 attn_data, norms_data = hooks.get_data()
+                self._last_obs_tokens = obs_tokens_enc  # seed state for run_rollout()
             except Exception as exc:
                 logger.debug("WM forward failed: %s", exc)
             hook_ms = (time.perf_counter() - t_wm) * 1000.0
