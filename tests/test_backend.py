@@ -1687,3 +1687,48 @@ class TestFeatureStability:
         engine = InferenceEngine(iris_src=str(_IRIS_SRC), iris_root=str(_IRIS_ROOT))
         out = engine.get_feature_stability()
         assert out["available"] is False and out["features"] == []
+
+
+# ---------------------------------------------------------------------------
+# Causal-importance ranking store + endpoint
+# ---------------------------------------------------------------------------
+
+class TestCausalRanking:
+
+    def test_store_ranks_descending(self, tmp_path):
+        from ranking_store import CausalRankingStore, resolve_causal_layer
+        store = CausalRankingStore(str(tmp_path), 5)
+        assert store.ranked()["available"] is False        # nothing written yet
+        store.save({
+            "layer": 5, "env_id": "Breakout", "n_steps": 20, "scale": 5.0, "seeds": 2,
+            "scores": {
+                "1": {"id": 1, "score": 0.5, "pos": 0.6, "neg": 0.4},
+                "2": {"id": 2, "score": 4.2, "pos": 5.0, "neg": 3.4},
+                "3": {"id": 3, "score": 1.1, "pos": 1.1, "neg": 1.1},
+            },
+        })
+        out = store.ranked(top=2)
+        assert out["available"] and out["n_features_scored"] == 3
+        assert [f["id"] for f in out["features"]] == [2, 3]   # descending score, top-2
+        assert resolve_causal_layer(str(tmp_path)) == 5       # single cache inferred
+
+    def test_endpoint(self, tmp_path, monkeypatch):
+        import importlib
+        monkeypatch.setenv("SAE_DIR", str(tmp_path))
+        monkeypatch.setenv("BOOKMARKS_PATH", str(tmp_path / "bm.json"))
+        monkeypatch.setenv("PINNED_PATH", str(tmp_path / "pinned.json"))
+        import main as main_mod
+        importlib.reload(main_mod)
+        from fastapi.testclient import TestClient
+        from ranking_store import CausalRankingStore
+
+        client = TestClient(main_mod.app, raise_server_exceptions=False)
+        # No cache → available false (not an error; the UI shows "run the pipeline").
+        assert client.get("/ranking/causal").json()["available"] is False
+
+        CausalRankingStore(str(tmp_path), 5).save({
+            "layer": 5, "scores": {"7": {"id": 7, "score": 3.0, "pos": 3.0, "neg": 3.0}}})
+        body = client.get("/ranking/causal").json()
+        assert body["available"] and body["features"][0]["id"] == 7
+
+        importlib.reload(main_mod)  # restore module for other tests

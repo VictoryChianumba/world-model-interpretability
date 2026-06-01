@@ -134,7 +134,19 @@ Built as a small engine change: a rolling 60-frame window of the full per-featur
 
 This is the first concrete instance of the project's thesis: importing the LLM convention naively (rank by a magnitude statistic) produces a broken ranking on the world-model substrate, and the fix requires a substrate-aware metric. The dead-feature degeneracy is logged in FINDINGS.
 
-Causal importance is the next piece (offline pipeline); comparative results between the three rankings go here once it has run.
+### Implementation — causal importance (done; partial sample measured)
+
+Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer}.json` → `GET /ranking/causal`, surfaced as the discovery panel's third toggle. For each feature it runs ±scale intervention rollouts against a shared baseline (same seed, same frozen action sequence) and scores by **mean token divergence** — token-only, no pixel decode, so it is far cheaper than the live `/rollout`. Injection is magnitude-relative (scale × the feature's own seed-state activation), matching the live intervention semantics. Built to sample and resume; `pos`/`neg` per-sign means are kept so an asymmetric feature is visible rather than averaged away.
+
+**Sample run — two independent runs, 24 most-active features, 2 seed states, 10 steps, ±5, MPS, ~9 min each:**
+
+- **Causal importance vs activation magnitude:** Spearman **+0.56** and **+0.64** across the two runs. Magnitude is a weak-to-moderate proxy for causal effect — within the *same* high-firing set, some features move the rollout hard (token divergence up to ~15 of 16) and others barely move it (~2 of 16). The single most-active feature (#1364) was also the most causal in both runs, but mid-ranking diverged. So magnitude predicts the very top but not the order.
+- **Run-to-run robustness:** the two runs shared only **18 of 30** distinct features — "top-K by activation" itself selected different features run-to-run (different seed states), the churn problem in another guise. On the shared set causal scores correlated at Spearman **+0.56**, with top-5 causal overlap **4/5**. The very top is reproducible; the tail is not from a single run.
+- **Sign asymmetry:** per-feature |effect(+5) − effect(−5)| averaged ~0.8 tokens — features respond asymmetrically to amplification vs suppression.
+
+**Caveat (scope, stated honestly):** this sample scores only the high-firing head (top-24 by activation), so the magnitude-vs-causal correlation is measured *within* active features and is biased **upward** — across all ~2K features, including the low-firing majority where the two diverge most, agreement would be lower. The sample is enough to show the pipeline works and that magnitude is an imperfect proxy even among active features; it is not the full-feature result. The full run (all features, more seeds) is the next step. Per single-measurement discipline, every number here is from a 2-run / 2-seed sample and should be read as provisional beyond the top handful.
+
+**Which ranking is "more interpretable"?** Not yet answerable on this evidence — it needs the autointerp labels (also built, not yet run) so a human can read the top features of each ranking side by side. What the sample *does* show: the three rankings genuinely disagree (firing is unstable frame-to-frame and run-to-run; causal only moderately tracks magnitude), so they are not redundant views — picking the ranking is a real choice, which is why all three are exposed.
 
 ## Part VII — Open threads
 

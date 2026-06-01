@@ -26,6 +26,7 @@ from inference import InferenceEngine
 from bookmarks import BookmarkStore
 from pinned import PinnedStore, _UNSET
 from autointerp_store import AutoInterpStore, resolve_layer
+from ranking_store import CausalRankingStore, resolve_causal_layer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -409,6 +410,21 @@ async def ranking_stability(
     Computed from the engine's rolling buffer, so it reflects the last ~N streamed frames.
     """
     return engine.get_feature_stability(top=top, min_firing=min_firing)
+
+
+@app.get("/ranking/causal")
+async def ranking_causal(
+    top: int = Query(20, ge=1, le=200),
+    layer: Optional[int] = Query(None),
+) -> dict:
+    """Rank SAE features by offline causal importance (mean token divergence under ±scale
+    intervention rollouts). Read-only; populated by scripts/causal_importance.py. Returns
+    ``available: false`` until that pipeline has run for this layer.
+    """
+    resolved = resolve_causal_layer(SAE_DIR, layer if layer is not None else engine.sae_layer)
+    if resolved is None:
+        return {"metric": "causal", "available": False, "features": []}
+    return CausalRankingStore(SAE_DIR, resolved).ranked(top=top)
 
 
 @app.get("/features")
