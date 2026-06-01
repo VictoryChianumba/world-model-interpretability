@@ -24,8 +24,12 @@ IRIS_ROOT=... pytest tests/test_backend.py::TestHookExtraction::test_attn_shape_
 
 ### Frontend
 
+`frontend/` is the **v2** UI (react-konva canvas of pinned SAE-feature cards). The legacy
+v1 panel-grid UI is preserved at `frontend-v1/` as a runnable fallback — both connect to the
+same backend; run the dev server from whichever directory you want.
+
 ```bash
-# From wm-visualizer/frontend/
+# From wm-visualizer/frontend/   (or frontend-v1/ for the legacy UI)
 npm run dev       # dev server → http://localhost:3000
 npm test          # Jest test suite (watch mode)
 npm test -- --watchAll=false   # single run, no watch
@@ -73,9 +77,22 @@ The inference thread **never blocks** — frames are dropped (not queued) when t
 
 - `hooks.py` — `IrisHookExtractor`: attach/detach forward hooks on `block.attn.attn_drop` (attention) and `block` (residual norm). Hooks store `.detach()` tensors only; no sync.
 - `inference.py` — `InferenceEngine`: background thread lifecycle, `FrameData` dataclass, `_decode_reconstruction()` helper, `_load_agent()` (uses Hydra compose API to load IRIS checkpoints without modifying IRIS source).
-- `main.py` — FastAPI app: WebSocket `/ws` and `/ws/latent`, REST `GET /agents`, `GET /config`, `GET /devices`, `POST /control` (loop/restart/pause/resume/switch_agent).
+- `main.py` — FastAPI app: WebSocket `/ws` and `/ws/latent`, REST `GET /agents`, `GET /config`, `GET /devices`, `POST /control` (loop/restart/pause/resume/switch_agent), `POST /rollout`, `GET/POST/DELETE /bookmarks`, `GET/POST/DELETE /pinned`, `GET /feature/{id}` + `GET /features`.
+- `pinned.py` — `PinnedStore`: JSON-backed v2 canvas state (one card = `{feature_id, custom_label, intervention_scale, x, y}` keyed by env+layer). `/pinned` POST has **merge semantics** (partial update writes only the fields sent; `custom_label=""` clears).
+- `autointerp_store.py` + `scripts/autointerp.py` — offline vision-LLM feature labeling. The script renders each feature's top-activating frames into a 4×4 grid and asks Claude what they share; labels + firing stats are cached under `<SAE_DIR>/autointerp_L{layer}.json` and served read-only by `/feature/{id}` and `/features`. Build-only: needs `ANTHROPIC_API_KEY`; until run, labels are null and the UI shows "unlabeled". `--no-llm`/`--limit`/`--resume` for cheap dry runs.
+
+**`/rollout` accepts multiple interventions.** The v2 form is `interventions: [{feature_id, scale}]`; the legacy single-feature `{feature_id, scale}` form still works. Because every SAE feature is read at the same layer, the per-feature raw-space directions are **summed** into one vector added to the residual — so N simultaneous interventions cost the same as one and `_rollout` itself is unchanged. Zero-scale cards are observation-only and dropped.
 
 ### Frontend
+
+The v2 main view (`frontend/src/app/page.tsx`) is a **canvas of pinned feature cards**:
+`FeatureCanvas` (react-konva, dynamically imported `ssr:false`) draws draggable cards with a
+sparkline + Konva scale-slider; `SearchBar` pins by id/label; `DiscoveryPanel` lists top-firing
+features to pin; `RolloutComparison` runs the multi-feature rollout read from cards with non-zero
+scale; `ModelInternals` holds the demoted attention/norms/log behind a default-hidden tab. New
+hooks: `usePinned`, `useFeatureIndex` (autointerp labels), `useActivationHistory` (sparklines).
+Card label resolves: per-card override → autointerp → bookmark → "unlabeled". The list below is
+shared/legacy infrastructure (also the whole v1 UI in `frontend-v1/`):
 
 - `useVisualizerSocket` (`hooks/`) — single hook managing WebSocket lifecycle, auto-reconnect (2s), intentional-close flag to prevent duplicate reconnect, `sendControl()` POSTs to `/control`.
 - `AttentionHeatmap` — visx heatmap, one subplot per head, axes labelled from `token_layout.labels`.
