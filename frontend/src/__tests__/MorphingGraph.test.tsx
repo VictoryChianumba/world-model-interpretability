@@ -35,7 +35,7 @@ function makeTokenLayout(
       i % tokensPerBlock === tokensPerBlock - 1 ? "act" : `o${i % tokensPerBlock}`,
     );
   }
-  return { labels };
+  return { labels, tokens_per_block: tokensPerBlock, obs_per_block: tokensPerBlock - 1 };
 }
 
 /**
@@ -219,6 +219,29 @@ describe("MorphingGraph", () => {
     );
     // Legend reads "Avg attn · Layer 7"
     expect(screen.getByText(/layer 7/i)).toBeInTheDocument();
+  });
+
+  it("preserves existing SVG nodes when only selectedLayer changes (no SVG rebuild)", async () => {
+    // When selectedLayer changes only Effect 2 should run, not Effect 1.
+    // Effect 1 clears the SVG with svg.selectAll("*").remove(), so if it ran
+    // the node references would be new objects. We verify the first circle is
+    // the same DOM node before and after the layer switch.
+    const tokenLayout = makeTokenLayout(5);
+    const { container, rerender } = render(
+      <MorphingGraph attention={null} selectedLayer={3} tokenLayout={tokenLayout} />,
+    );
+    await act(async () => {});
+    const circlesBefore = container.querySelectorAll("svg circle");
+    expect(circlesBefore).toHaveLength(5);
+
+    rerender(
+      <MorphingGraph attention={null} selectedLayer={7} tokenLayout={tokenLayout} />,
+    );
+    await act(async () => {});
+    const circlesAfter = container.querySelectorAll("svg circle");
+    expect(circlesAfter).toHaveLength(5);
+    // Same DOM node — SVG was not rebuilt
+    expect(circlesBefore[0]).toBe(circlesAfter[0]);
   });
 
   it("updates the legend when selectedLayer prop changes", () => {

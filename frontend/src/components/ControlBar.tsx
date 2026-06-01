@@ -15,6 +15,8 @@ interface Props {
   connected: boolean;
   loading: boolean;
   sendControl: (cmd: ControlCommand) => Promise<void>;
+  /** Optional slot rendered before the connection indicator (e.g. nav links). */
+  navSlot?: React.ReactNode;
 }
 
 export default function ControlBar({
@@ -30,6 +32,7 @@ export default function ControlBar({
   connected,
   loading,
   sendControl,
+  navSlot,
 }: Props) {
   function handleAgentChange(e: React.ChangeEvent<HTMLSelectElement>) {
     const agent = agents.find((a) => a.id === e.target.value);
@@ -128,6 +131,13 @@ export default function ControlBar({
         </button>
         <button
           className={btn}
+          onClick={() => sendControl({ command: "step" })}
+          title="Advance one frame (while paused). Computes the WM-imagined next frame."
+        >
+          Step ▶|
+        </button>
+        <button
+          className={btn}
           onClick={() => sendControl({ command: "loop", payload: { enabled: true } })}
           title="Enable episode looping"
         >
@@ -155,6 +165,9 @@ export default function ControlBar({
 
       {/* Spacer */}
       <div className="flex-1" />
+
+      {/* Optional nav slot */}
+      {navSlot}
 
       {/* Connection indicator */}
       <div className="flex items-center gap-1.5">
