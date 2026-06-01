@@ -666,19 +666,24 @@ class InferenceEngine:
 
     def run_rollout(
         self,
-        feature_id: int,
-        scale: float,
+        interventions: List[Tuple[int, float]],
         n_steps: int = 20,
         n_seeds: int = 2,
     ) -> dict:
         """Run paired baseline vs intervened N-step imagined rollouts from the current frame.
 
-        The experiment the tool exists for: does scaling SAE feature ``feature_id`` in the
+        The experiment the tool exists for: does scaling one or more SAE features in the
         WM residual stream change the *dynamics* of an imagined rollout (not just one frame).
+
+        ``interventions`` is a list of ``(feature_id, scale)`` pairs. Because every SAE
+        feature is read at the same layer, their raw-space directions simply **sum** into a
+        single vector added to the residual — so N simultaneous interventions cost no more
+        than one. Zero-scale entries are observation-only and must be filtered by the caller.
 
         Design (all confirmed with the user):
           - Intervention applied AS-IS via ``_intervention_direction`` (the current merged
-            all-positions, magnitude-relative injection — this method is unchanged here).
+            all-positions, magnitude-relative injection — that method is unchanged here),
+            summed across the requested features.
           - A single ACTION SEQUENCE is chosen once on a reference baseline rollout, frozen,
             and replayed IDENTICALLY in every seed/condition — so any trajectory divergence is
             attributable to the intervention, not to different action choices.
@@ -713,9 +718,21 @@ class InferenceEngine:
                 raise RuntimeError("No seed frame yet — step at least once before a rollout")
             init = init.to(device)
 
-            iv_dir = self._intervention_direction(feature_id, scale)
-            if iv_dir is None:
-                raise RuntimeError("Intervention direction unavailable (bad feature_id or scale 0)")
+            # Sum each feature's raw-space contribution into one combined direction.
+            # All features share ``layer``, so multiple interventions reduce to a single
+            # (layer, direction) added to the residual — no extra forward passes.
+            combined = None
+            active: List[Tuple[int, float]] = []
+            for fid, sc in interventions:
+                d = self._intervention_direction(int(fid), float(sc))
+                if d is None:
+                    continue
+                combined = d if combined is None else combined + d
+                active.append((int(fid), float(sc)))
+            if combined is None:
+                raise RuntimeError(
+                    "No usable interventions (all feature_ids invalid or scale 0)"
+                )
 
             # --- Fixed action sequence: chosen once on a reference baseline, then frozen ---
             actions = self._rollout_actions(wm, tokenizer, init, device, n_steps, seed=0)
@@ -744,7 +761,7 @@ class InferenceEngine:
                 return seeds_json, seeds_rgb, seeds_tok
 
             baseline, base_rgb, base_tok = run(None)
-            intervened, iv_rgb, iv_tok = run((layer, iv_dir))
+            intervened, iv_rgb, iv_tok = run((layer, combined))
 
             # --- Divergence trajectories (robust signal even when pixel state-extract
             # fails on lossy frames): per step, averaged over paired seeds ---
@@ -763,8 +780,11 @@ class InferenceEngine:
                 pixel_div.append(round(sum(pd) / len(pd), 3))
 
         return {
-            "feature_id": int(feature_id),
-            "scale": float(scale),
+            # Multi-feature form: every intervention actually applied this rollout.
+            "interventions": [{"feature_id": f, "scale": s} for f, s in active],
+            # Legacy single-feature fields (v1 frontend reads these) — first active feature.
+            "feature_id": int(active[0][0]),
+            "scale": float(active[0][1]),
             "layer": int(layer),
             "n_steps": int(n_steps),
             "n_seeds": int(n_seeds),
@@ -884,6 +904,11 @@ class InferenceEngine:
         if self._total_frames == 0:
             return 0.0
         return self._drop_count / self._total_frames
+
+    @property
+    def sae_layer(self) -> Optional[int]:
+        """WM layer the loaded SAE reads, or None if no SAE is loaded."""
+        return self._sae_layer
 
     def get_config(self) -> dict:
         """Current model config (returns empty dict if no agent loaded)."""

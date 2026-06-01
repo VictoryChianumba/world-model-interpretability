@@ -1311,6 +1311,182 @@ class TestBookmarkStore:
 
 
 # ---------------------------------------------------------------------------
+# Pinned features (v2 canvas state)
+# ---------------------------------------------------------------------------
+
+class TestPinnedStore:
+
+    def test_partial_upsert_merges_fields(self, tmp_path):
+        """A pin merges only the fields it's given; omitted fields keep their value."""
+        from pinned import PinnedStore
+        store = PinnedStore(str(tmp_path / "pinned.json"))
+
+        store.upsert("Breakout", 5, 42, x=10.0, y=20.0, updated_at="t0")
+        # Move only — scale stays default, label stays None.
+        store.upsert("Breakout", 5, 42, x=99.0, y=99.0, updated_at="t1")
+        # Scale only — position from the move is preserved.
+        store.upsert("Breakout", 5, 42, intervention_scale=2.5, updated_at="t2")
+        rec = store.list("Breakout", 5)[0]
+        assert rec["x"] == 99.0 and rec["y"] == 99.0
+        assert rec["intervention_scale"] == 2.5
+        assert rec["custom_label"] is None
+
+    def test_label_set_and_clear(self, tmp_path):
+        """Non-empty label is trimmed and stored; empty string clears it back to null."""
+        from pinned import PinnedStore
+        store = PinnedStore(str(tmp_path / "pinned.json"))
+        store.upsert("Breakout", 5, 7, custom_label="  paddle tracker ")
+        assert store.list()[0]["custom_label"] == "paddle tracker"
+        store.upsert("Breakout", 5, 7, custom_label="")
+        assert store.list()[0]["custom_label"] is None
+
+    def test_filter_and_delete(self, tmp_path):
+        from pinned import PinnedStore
+        store = PinnedStore(str(tmp_path / "pinned.json"))
+        store.upsert("Breakout", 5, 1)
+        store.upsert("Breakout", 5, 2)
+        store.upsert("Breakout", 3, 9)
+        assert {p["feature_id"] for p in store.list("Breakout", 5)} == {1, 2}
+        assert store.list("Breakout", 3) and len(store.list("Breakout", 3)) == 1
+        assert store.delete("Breakout", 5, 1) is True
+        assert store.delete("Breakout", 5, 1) is False
+        assert len(store.list()) == 2
+
+    def test_endpoints_roundtrip_via_testclient(self, tmp_path, monkeypatch):
+        """GET/POST/DELETE /pinned with merge semantics via FastAPI TestClient."""
+        import importlib
+        monkeypatch.setenv("PINNED_PATH", str(tmp_path / "pinned.json"))
+        import main as main_mod
+        importlib.reload(main_mod)
+        from fastapi.testclient import TestClient
+
+        client = TestClient(main_mod.app, raise_server_exceptions=False)
+        assert client.get("/pinned").json() == []
+
+        # Pin with a position.
+        r = client.post("/pinned", json={
+            "env_id": "BreakoutNoFrameskip-v4", "layer": 5, "feature_id": 42,
+            "x": 12.0, "y": 34.0})
+        assert r.json()["status"] == "ok"
+        assert r.json()["pinned"]["intervention_scale"] == 0.0  # observation-only default
+
+        # Partial update: scale only — must not clobber x/y.
+        client.post("/pinned", json={
+            "env_id": "BreakoutNoFrameskip-v4", "layer": 5, "feature_id": 42,
+            "intervention_scale": 3.0})
+        got = client.get("/pinned", params={
+            "env_id": "BreakoutNoFrameskip-v4", "layer": 5}).json()
+        assert len(got) == 1
+        assert got[0]["x"] == 12.0 and got[0]["intervention_scale"] == 3.0
+
+        d = client.delete("/pinned", params={
+            "env_id": "BreakoutNoFrameskip-v4", "layer": 5, "feature_id": 42})
+        assert d.json()["deleted"] is True
+        assert client.get("/pinned").json() == []
+
+        importlib.reload(main_mod)  # restore module for other tests
+
+
+# ---------------------------------------------------------------------------
+# Autointerp feature-label cache + /feature endpoint
+# ---------------------------------------------------------------------------
+
+class TestAutoInterpStore:
+
+    def test_write_read_roundtrip(self, tmp_path):
+        from autointerp_store import AutoInterpStore
+        store = AutoInterpStore(str(tmp_path), 5)
+        index = {"layer": 5, "env_id": "Breakout", "features": {
+            "42": {"id": 42, "label": "ball near paddle",
+                   "firing_rate": 0.12, "mean_activation": 0.4, "max_activation": 3.2},
+        }}
+        store.save_index(index)
+        store.write_examples(42, examples_b64=["AAA", "BBB"],
+                             top_activations=[3.2, 2.1], frame_indices=[10, 5])
+        f = store.read_feature(42)
+        assert f["label"] == "ball near paddle" and f["layer"] == 5
+        assert f["top_activation_examples"] == ["AAA", "BBB"]
+
+    def test_missing_feature_is_graceful(self, tmp_path):
+        """Unknown / unlabeled feature reads back as null label with no examples."""
+        from autointerp_store import AutoInterpStore
+        store = AutoInterpStore(str(tmp_path), 5)
+        store.save_index({"layer": 5, "features": {}})
+        f = store.read_feature(999)
+        assert f["label"] is None and f["top_activation_examples"] == []
+
+    def test_resolve_layer(self, tmp_path):
+        from autointerp_store import AutoInterpStore, resolve_layer
+        assert resolve_layer(str(tmp_path)) is None          # no cache yet
+        AutoInterpStore(str(tmp_path), 5).save_index({"layer": 5, "features": {}})
+        assert resolve_layer(str(tmp_path)) == 5             # single cache → inferred
+        assert resolve_layer(str(tmp_path), 9) == 9          # explicit wins
+
+    def test_feature_endpoint(self, tmp_path, monkeypatch):
+        """/feature/{id} serves the cache; 404 when none exists and no layer given."""
+        import importlib
+        monkeypatch.setenv("SAE_DIR", str(tmp_path))
+        monkeypatch.setenv("BOOKMARKS_PATH", str(tmp_path / "bm.json"))
+        monkeypatch.setenv("PINNED_PATH", str(tmp_path / "pinned.json"))
+        import main as main_mod
+        importlib.reload(main_mod)
+        from fastapi.testclient import TestClient
+        from autointerp_store import AutoInterpStore
+
+        client = TestClient(main_mod.app, raise_server_exceptions=False)
+        # No cache, no layer hint → 404 with a helpful message.
+        assert client.get("/feature/3").status_code == 404
+        assert client.get("/features").json()["features"] == {}
+
+        # Populate a layer-5 cache, then it serves (layer inferred from the single cache).
+        AutoInterpStore(str(tmp_path), 5).save_index({"layer": 5, "features": {
+            "3": {"id": 3, "label": "bricks cleared", "firing_rate": 0.2,
+                  "mean_activation": 0.5, "max_activation": 4.0}}})
+        body = client.get("/feature/3").json()
+        assert body["label"] == "bricks cleared" and body["layer"] == 5
+        # Unlabeled feature in the same cache → null label, no examples.
+        assert client.get("/feature/77").json()["label"] is None
+
+        importlib.reload(main_mod)  # restore module for other tests
+
+
+# ---------------------------------------------------------------------------
+# /rollout request normalization (multi-feature vs legacy single-feature)
+# ---------------------------------------------------------------------------
+
+class TestRolloutEndpointValidation:
+    """The endpoint normalizes both request shapes and rejects empty interventions
+    BEFORE touching the engine — these paths need no loaded model."""
+
+    @staticmethod
+    def _client():
+        import importlib
+        import main as main_mod
+        importlib.reload(main_mod)
+        from fastapi.testclient import TestClient
+        return TestClient(main_mod.app, raise_server_exceptions=False), main_mod
+
+    def test_rejects_missing_interventions(self):
+        import importlib
+        client, main_mod = self._client()
+        # Neither `interventions` nor legacy `feature_id` → 422.
+        assert client.post("/rollout", json={"n_steps": 5}).status_code == 422
+        importlib.reload(main_mod)
+
+    def test_rejects_all_zero_scale(self):
+        import importlib
+        client, main_mod = self._client()
+        # All observation-only (scale 0) → nothing to run → 422.
+        r = client.post("/rollout", json={"interventions": [
+            {"feature_id": 1, "scale": 0.0}, {"feature_id": 2, "scale": 0.0}]})
+        assert r.status_code == 422
+        # Legacy zero-scale form too.
+        r2 = client.post("/rollout", json={"feature_id": 1, "scale": 0.0})
+        assert r2.status_code == 422
+        importlib.reload(main_mod)
+
+
+# ---------------------------------------------------------------------------
 # N-step rollout
 # ---------------------------------------------------------------------------
 

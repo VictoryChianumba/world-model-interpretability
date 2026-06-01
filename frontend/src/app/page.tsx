@@ -1,41 +1,39 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import ControlBar from "@/components/ControlBar";
 import GameFrame from "@/components/GameFrame";
-import AttentionHeatmap from "@/components/AttentionHeatmap";
-import MorphingGraph from "@/components/MorphingGraph";
-import ActivationNorms from "@/components/ActivationNorms";
-import SAEFeaturePanel from "@/components/SAEFeaturePanel";
-import RolloutPanel from "@/components/RolloutPanel";
-import TrajectoryCharts from "@/components/TrajectoryCharts";
-import LogPane from "@/components/LogPane";
-import type { AgentInfo } from "@/hooks/useVisualizerSocket";
+import SearchBar from "@/components/SearchBar";
+import DiscoveryPanel from "@/components/DiscoveryPanel";
+import RolloutComparison from "@/components/RolloutComparison";
+import ModelInternals from "@/components/ModelInternals";
+import type { CardVM } from "@/components/FeatureCanvas";
+import type { AgentInfo, ControlCommand } from "@/hooks/useVisualizerSocket";
 import { useVisualizerSocket } from "@/hooks/useVisualizerSocket";
 import { useBookmarks } from "@/hooks/useBookmarks";
-import { useRollout } from "@/hooks/useRollout";
+import { useRollout, type Intervention } from "@/hooks/useRollout";
+import { usePinned } from "@/hooks/usePinned";
+import { useFeatureIndex } from "@/hooks/useFeatureIndex";
+import { useActivationHistory } from "@/hooks/useActivationHistory";
+import { API_BASE } from "@/lib/config";
 
-const API_BASE =
-  typeof window !== "undefined"
-    ? `http://${window.location.hostname}:8000`
-    : "http://localhost:8000";
+// react-konva touches `window` at import → load the canvas client-side only.
+const FeatureCanvas = dynamic(() => import("@/components/FeatureCanvas"), {
+  ssr: false,
+  loading: () => <div className="h-full w-full rounded-lg bg-[#161629]" />,
+});
 
 export default function Home() {
   const [selectedAgent, setSelectedAgent] = useState<string>("");
-  const [selectedLayer, setSelectedLayer] = useState<number>(5);
+  const [selectedLayer, setSelectedLayer] = useState<number>(5); // attention layer (internals)
   const [selectedDevice, setSelectedDevice] = useState<string>("cpu");
   const [availableDevices, setAvailableDevices] = useState<string[]>(["cpu"]);
-  const [activeView, setActiveView] = useState<"heatmap" | "graph">("heatmap");
-  // Top-level view: the intervention experiment is primary; attention/norms are demoted.
-  const [mainView, setMainView] = useState<"experiment" | "analysis">("experiment");
-  const [ivFeatureId, setIvFeatureId] = useState<number | null>(null);
-  // Magnitude-relative multiplier of the feature's own activation (±20, default 5×).
-  const [ivScale, setIvScale] = useState<number>(5);
-  // Shared scrub index between the rollout viewer and the trajectory charts.
-  const [frameIdx, setFrameIdx] = useState<number>(0);
+  const [view, setView] = useState<"canvas" | "internals">("canvas");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [paused, setPaused] = useState(false);
 
-  // Fetch available devices from the backend once on mount
   useEffect(() => {
     fetch(`${API_BASE}/devices`)
       .then((r) => r.json())
@@ -43,27 +41,35 @@ export default function Home() {
         setAvailableDevices(data.available);
         setSelectedDevice(data.default);
       })
-      .catch(() => {
-        // Backend not ready yet — keep cpu default, will retry on reconnect
-      });
+      .catch(() => {});
   }, []);
 
-  const { state, sendControl } = useVisualizerSocket(
+  const { state, sendControl: rawSendControl } = useVisualizerSocket(
     selectedAgent || undefined,
     undefined,
     selectedDevice,
   );
-  const { result: rollout, loading: rolloutLoading, error: rolloutError, run: runRollout } =
-    useRollout();
 
-  // Once we receive the agent list from the backend, default-select the first
+  // Track pause locally (the socket doesn't surface it) so the rollout button can gate on
+  // it — the experiment is paused-only. ControlBar's buttons go through this wrapper too.
+  const sendControl = useCallback(
+    async (cmd: ControlCommand) => {
+      if (cmd.command === "pause") setPaused(true);
+      else if (cmd.command === "resume" || cmd.command === "restart") setPaused(false);
+      // "step" leaves paused === true.
+      await rawSendControl(cmd);
+    },
+    [rawSendControl],
+  );
+
+  const { result: rollout, loading: rolloutLoading, error: rolloutError, runMulti } = useRollout();
+
   useEffect(() => {
     if (state.config?.agents && state.config.agents.length > 0 && !selectedAgent) {
       setSelectedAgent(state.config.agents[0].id);
     }
   }, [state.config, selectedAgent]);
 
-  // Clamp layer to valid range when config updates
   useEffect(() => {
     const numLayers = state.config?.num_layers;
     if (numLayers != null && numLayers > 0) {
@@ -73,38 +79,62 @@ export default function Home() {
 
   const agents: AgentInfo[] = state.config?.agents ?? [];
   const numLayers = state.config?.num_layers ?? 10;
-  const numHeads = state.config?.num_heads ?? 4;
-
-  // Feature bookmarks for the current game + SAE layer (persist across sessions).
   const envId = agents.find((a) => a.id === selectedAgent)?.env_id;
-  const { labelFor } = useBookmarks(envId, state.sae_layer);
+  const saeLayer = state.sae_layer;
 
-  function handleAgentChange(agent: AgentInfo) {
-    setSelectedAgent(agent.id);
-    // sendControl is called by ControlBar
-  }
+  // Pinned cards (canvas), autointerp labels (search/labels), bookmark labels (fallback),
+  // and per-feature firing history (sparklines).
+  const { pins, pin, unpin, update, isPinned } = usePinned(envId, saeLayer);
+  const { features, loaded: indexLoaded, labelFor: autoLabelFor, search } = useFeatureIndex(saeLayer);
+  const { labelFor: bookmarkLabelFor } = useBookmarks(envId, saeLayer);
+  const { historyFor, currentFor } = useActivationHistory(state.sae_features, state.metrics?.step);
 
-  // Selecting a feature / changing scale just updates local experiment state; the
-  // rollout endpoint reads these when "Run rollout" is clicked (paused-only).
-  function handleSelectFeature(id: number) {
-    setIvFeatureId(id);
-  }
+  // Resolve a card's display label: user override → autointerp → bookmark → null.
+  const resolveLabel = useCallback(
+    (id: number, custom: string | null): string | null =>
+      custom ?? autoLabelFor(id) ?? bookmarkLabelFor(id) ?? null,
+    [autoLabelFor, bookmarkLabelFor],
+  );
 
-  function handleRunRollout() {
-    if (ivFeatureId == null) return;
-    setFrameIdx(0);
-    runRollout(ivFeatureId, ivScale);
-  }
+  const cards: CardVM[] = useMemo(
+    () =>
+      pins.map((p) => ({
+        featureId: p.feature_id,
+        x: p.x,
+        y: p.y,
+        label: resolveLabel(p.feature_id, p.custom_label),
+        customLabel: p.custom_label,
+        activation: currentFor(p.feature_id),
+        maxActivation: features[p.feature_id]?.max_activation ?? 4,
+        history: historyFor(p.feature_id),
+        interventionScale: p.intervention_scale,
+      })),
+    [pins, resolveLabel, currentFor, features, historyFor],
+  );
 
-  const saeLoaded = state.sae_layer != null;
+  // Discovery-panel labels use the same resolution (sans per-card custom override).
+  const discoveryLabelFor = useCallback(
+    (id: number) => autoLabelFor(id) ?? bookmarkLabelFor(id) ?? null,
+    [autoLabelFor, bookmarkLabelFor],
+  );
+
+  // The rollout intervention is read straight off the canvas: cards with non-zero scale.
+  const interventions: Intervention[] = useMemo(
+    () =>
+      pins
+        .filter((p) => p.intervention_scale !== 0)
+        .map((p) => ({ feature_id: p.feature_id, scale: p.intervention_scale })),
+    [pins],
+  );
+
+  const steeringCount = interventions.length;
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden">
-      {/* ── Top bar ─────────────────────────────────────────────────── */}
+    <div className="flex h-screen flex-col overflow-hidden bg-[#0b0b16] text-slate-100">
       <ControlBar
         agents={agents}
         selectedAgent={selectedAgent}
-        onAgentChange={handleAgentChange}
+        onAgentChange={(a) => setSelectedAgent(a.id)}
         availableDevices={availableDevices}
         selectedDevice={selectedDevice}
         onDeviceChange={setSelectedDevice}
@@ -116,189 +146,103 @@ export default function Home() {
         sendControl={sendControl}
         navSlot={
           <div className="flex items-center gap-2">
-            {/* Primary view switch: Experiment (intervention rollouts) vs Analysis (attention/norms) */}
             <div className="flex items-center gap-0.5">
-              <button
-                data-testid="main-view-experiment"
-                className={`px-2 py-0.5 text-[9px] rounded transition-colors ${
-                  mainView === "experiment" ? "bg-indigo-600 text-white" : "text-gray-500 hover:text-gray-300"
-                }`}
-                onClick={() => setMainView("experiment")}
-              >
-                Experiment
-              </button>
-              <button
-                data-testid="main-view-analysis"
-                className={`px-2 py-0.5 text-[9px] rounded transition-colors ${
-                  mainView === "analysis" ? "bg-indigo-600 text-white" : "text-gray-500 hover:text-gray-300"
-                }`}
-                onClick={() => setMainView("analysis")}
-              >
-                Analysis
-              </button>
+              {(["canvas", "internals"] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  className={`rounded px-2 py-0.5 text-[10px] capitalize transition-colors ${
+                    view === v ? "bg-indigo-600 text-white" : "text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  {v === "internals" ? "Model internals" : "Canvas"}
+                </button>
+              ))}
             </div>
-            <Link href="/latent" className="text-xs text-gray-400 hover:text-indigo-300 transition-colors">
+            <Link href="/latent" className="text-xs text-slate-400 transition-colors hover:text-indigo-300">
               Latent View
             </Link>
           </div>
         }
       />
 
-      {mainView === "experiment" ? (
-        /* ── Experiment: the intervention-rollout column + live frame + features ── */
-        <main className="flex flex-1 overflow-hidden divide-x divide-gray-800">
-          {/* Left: live game frame + SAE feature list */}
-          <div className="w-1/4 min-w-56 flex flex-col divide-y divide-gray-800">
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <PaneTitle>Game</PaneTitle>
-              <div className="flex-1 overflow-hidden">
-                <GameFrame frame={state.frame} loading={state.loading} />
+      {view === "canvas" ? (
+        <main className="flex min-h-0 flex-1">
+          {/* Sidebar: live frame (context) + discovery panel (find candidates) */}
+          {sidebarOpen && (
+            <aside className="flex w-64 flex-shrink-0 flex-col border-r border-slate-800">
+              <div className="flex-shrink-0 border-b border-slate-800">
+                <div className="px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  Live {paused && <span className="text-amber-400">· paused</span>}
+                </div>
+                <div className="h-40">
+                  <GameFrame frame={state.frame} loading={state.loading} />
+                </div>
+                {state.metrics && (
+                  <div className="flex justify-between px-3 py-1 font-mono text-[10px] text-slate-500">
+                    <span>step {state.metrics.step}</span>
+                    <span>ep {state.metrics.episode}</span>
+                    <span>{state.metrics.infer_fps?.toFixed(0)} fps</span>
+                  </div>
+                )}
               </div>
-            </div>
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <PaneTitle>SAE Features {state.sae_layer != null ? `· layer ${state.sae_layer}` : ""}</PaneTitle>
-              <div className="flex-1 overflow-hidden">
-                <SAEFeaturePanel
+              <div className="min-h-0 flex-1">
+                <DiscoveryPanel
                   features={state.sae_features}
-                  layer={state.sae_layer}
-                  selectedId={ivFeatureId}
-                  onSelect={handleSelectFeature}
-                  labelFor={labelFor}
+                  labelFor={discoveryLabelFor}
+                  onPin={pin}
+                  isPinned={isPinned}
+                  paused={paused}
                 />
               </div>
-            </div>
-          </div>
+            </aside>
+          )}
 
-          {/* Right: the experiment column — controls → rollout → trajectories */}
-          <div className="flex-1 flex flex-col min-w-0 divide-y divide-gray-800">
-            {/* Intervention controls + Run */}
-            <div className="flex items-center gap-3 px-3 py-2 bg-gray-900 flex-shrink-0 text-xs">
-              {!saeLoaded ? (
-                <span className="text-gray-600">No SAE loaded — intervention rollouts unavailable</span>
-              ) : ivFeatureId == null ? (
-                <span className="text-gray-600">Pick a feature on the left to target it</span>
-              ) : (
-                <>
-                  <span className="text-pink-300 font-mono">
-                    feature #{ivFeatureId}
-                    {labelFor(ivFeatureId) ? ` · ${labelFor(ivFeatureId)}` : ""}
-                  </span>
-                  <span className="text-gray-500">scale ×</span>
-                  <input
-                    type="range"
-                    min={-20}
-                    max={20}
-                    step={1}
-                    value={ivScale}
-                    onChange={(e) => setIvScale(Number(e.target.value))}
-                    className="flex-1 max-w-48 accent-pink-500"
-                  />
-                  <span className="font-mono text-gray-300 w-8 text-right">{ivScale.toFixed(0)}×</span>
-                  <button
-                    type="button"
-                    onClick={handleRunRollout}
-                    disabled={rolloutLoading || !state.connected}
-                    className="px-3 py-1 rounded text-xs font-medium border border-pink-700 text-pink-200 hover:border-pink-500 disabled:opacity-40"
-                    title="Pause first; runs a paused-only N-step rollout (~80s CPU)"
-                  >
-                    {rolloutLoading ? "Running…" : "Run rollout"}
-                  </button>
-                  <span className="text-[9px] text-gray-600">pause first</span>
-                </>
-              )}
+          {/* Main: search + canvas (primary) + rollout comparison (experiment) */}
+          <section className="flex min-w-0 flex-1 flex-col">
+            <div className="flex flex-shrink-0 items-center gap-3 border-b border-slate-800 px-3 py-2">
+              <button
+                onClick={() => setSidebarOpen((s) => !s)}
+                title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+                className="rounded border border-slate-700 px-1.5 py-0.5 text-xs text-slate-400 hover:text-slate-200"
+              >
+                {sidebarOpen ? "⟨" : "⟩"}
+              </button>
+              <SearchBar search={search} onPin={pin} isPinned={isPinned} indexLoaded={indexLoaded} />
+              <div className="ml-auto text-[11px] text-slate-500">
+                {pins.length} card{pins.length === 1 ? "" : "s"}
+                {steeringCount > 0 && <span className="text-pink-400"> · {steeringCount} steering</span>}
+                {saeLayer != null && <span> · SAE L{saeLayer}</span>}
+              </div>
             </div>
 
-            {/* Rollout comparison (scrubbable side-by-side) */}
-            <div className="flex-[3] min-h-0 overflow-hidden">
-              <RolloutPanel
-                result={rollout}
-                loading={rolloutLoading}
-                error={rolloutError}
-                frameIdx={frameIdx}
-                onFrameIdx={setFrameIdx}
+            <div className="min-h-0 flex-[3] p-2">
+              <FeatureCanvas
+                cards={cards}
+                onMove={(id, x, y, persist) => update(id, { x, y }, persist)}
+                onScale={(id, scale, persist) => update(id, { intervention_scale: scale }, persist)}
+                onRemove={unpin}
+                onRelabel={(id, label) => update(id, { custom_label: label })}
               />
             </div>
 
-            {/* Trajectory charts */}
-            <div className="flex-[2] min-h-0 overflow-hidden">
-              <PaneTitle>Trajectories · baseline vs intervened (per-seed faint, mean bold)</PaneTitle>
-              <div className="flex-1 overflow-hidden h-full">
-                <TrajectoryCharts result={rollout} frameIdx={frameIdx} />
-              </div>
+            <div className="min-h-0 flex-[2] border-t border-slate-800">
+              <RolloutComparison
+                interventions={interventions}
+                paused={paused}
+                result={rollout}
+                loading={rolloutLoading}
+                error={rolloutError}
+                onRun={(nSteps, nSeeds) => runMulti(interventions, nSteps, nSeeds)}
+              />
             </div>
-          </div>
+          </section>
         </main>
       ) : (
-        /* ── Analysis: attention/norms/log (demoted, internals unchanged) ── */
-        <main className="flex flex-1 overflow-hidden divide-x divide-gray-800">
-          <div className="flex-1 flex flex-col min-w-0">
-            <div className="px-2 py-0.5 bg-gray-900 border-b border-gray-800 flex-shrink-0 flex items-center justify-between">
-              <span className="text-[10px] text-gray-500 uppercase tracking-wider">
-                Attention · Layer {selectedLayer}
-              </span>
-              <div className="flex items-center gap-0.5">
-                <button
-                  data-testid="view-toggle-heatmap"
-                  className={`px-2 py-0.5 text-[9px] rounded transition-colors ${
-                    activeView === "heatmap" ? "bg-indigo-600 text-white" : "text-gray-500 hover:text-gray-300"
-                  }`}
-                  onClick={() => setActiveView("heatmap")}
-                >
-                  Heatmap
-                </button>
-                <button
-                  data-testid="view-toggle-graph"
-                  className={`px-2 py-0.5 text-[9px] rounded transition-colors ${
-                    activeView === "graph" ? "bg-indigo-600 text-white" : "text-gray-500 hover:text-gray-300"
-                  }`}
-                  onClick={() => setActiveView("graph")}
-                >
-                  Graph
-                </button>
-              </div>
-            </div>
-            <div className="flex-1 overflow-hidden">
-              {activeView === "heatmap" ? (
-                <AttentionHeatmap
-                  attention={state.attention}
-                  selectedLayer={selectedLayer}
-                  tokenLayout={state.token_layout}
-                  numHeads={numHeads}
-                />
-              ) : (
-                <MorphingGraph
-                  attention={state.attention}
-                  selectedLayer={selectedLayer}
-                  tokenLayout={state.token_layout}
-                />
-              )}
-            </div>
-          </div>
-
-          <div className="flex-1 flex flex-col min-w-0 divide-y divide-gray-800">
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <PaneTitle>Activation Norms</PaneTitle>
-              <div className="flex-1 overflow-hidden">
-                <ActivationNorms norms={state.norms} numLayers={numLayers} />
-              </div>
-            </div>
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <PaneTitle>Log</PaneTitle>
-              <div className="flex-1 overflow-hidden">
-                <LogPane metrics={state.metrics} events={state.events} />
-              </div>
-            </div>
-          </div>
+        <main className="min-h-0 flex-1">
+          <ModelInternals state={state} selectedLayer={selectedLayer} />
         </main>
       )}
-    </div>
-  );
-}
-
-function PaneTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="px-2 py-0.5 text-[10px] text-gray-500 bg-gray-900 border-b border-gray-800 flex-shrink-0 uppercase tracking-wider">
-      {children}
     </div>
   );
 }

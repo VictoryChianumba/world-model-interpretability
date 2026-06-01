@@ -24,6 +24,8 @@ from pydantic import BaseModel
 
 from inference import InferenceEngine
 from bookmarks import BookmarkStore
+from pinned import PinnedStore, _UNSET
+from autointerp_store import AutoInterpStore, resolve_layer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -53,6 +55,8 @@ SAE_DIR = os.environ.get("SAE_DIR", CHECKPOINT_DIR)
 DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "cpu")
 # JSON store for SAE feature bookmarks (the backend's only persistence)
 BOOKMARKS_PATH = os.environ.get("BOOKMARKS_PATH", str(Path(SAE_DIR) / "bookmarks.json"))
+# JSON store for v2 canvas pinned features (source of truth for the canvas layout)
+PINNED_PATH = os.environ.get("PINNED_PATH", str(Path(SAE_DIR) / "pinned.json"))
 
 # Map checkpoint stem → Atari env ID (fallback: append NoFrameskip-v4)
 _KNOWN_ENV_IDS: Dict[str, str] = {
@@ -85,6 +89,7 @@ app.add_middleware(
 
 engine = InferenceEngine(iris_src=IRIS_SRC, iris_root=IRIS_ROOT, sae_dir=SAE_DIR)
 bookmarks = BookmarkStore(BOOKMARKS_PATH)
+pinned = PinnedStore(PINNED_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +209,17 @@ async def control(cmd: ControlCommand) -> dict:
 # Intervention rollout (paused-only, on-demand N-step experiment)
 # ---------------------------------------------------------------------------
 
-class RolloutCommand(BaseModel):
+class InterventionItem(BaseModel):
     feature_id: int
     scale: float
+
+
+class RolloutCommand(BaseModel):
+    # New multi-feature form: a list of interventions summed in the residual stream.
+    interventions: Optional[List[InterventionItem]] = None
+    # Legacy single-feature form (v1 frontend) — used only when `interventions` is absent.
+    feature_id: Optional[int] = None
+    scale: Optional[float] = None
     n_steps: int = 20
     n_seeds: int = 2
 
@@ -215,17 +228,35 @@ class RolloutCommand(BaseModel):
 async def run_rollout(cmd: RolloutCommand) -> dict:
     """Run paired baseline vs intervened N-step imagined rollouts from the current frame.
 
-    Heavy (~n_seeds * 2 * n_steps * 17 WM passes) and paused-only — runs off the event
-    loop in a thread. Returns frames + Breakout state per step for both conditions.
+    Accepts either the v2 multi-feature form (``interventions: [{feature_id, scale}, ...]``)
+    or the legacy single-feature form (``feature_id`` + ``scale``). Zero-scale entries are
+    observation-only and dropped. Heavy (~n_seeds * 2 * n_steps * 17 WM passes) and
+    paused-only — runs off the event loop in a thread.
     """
     from fastapi import HTTPException
     loop = asyncio.get_event_loop()
+
+    # Normalize both request forms to a list of (feature_id, scale) tuples.
+    if cmd.interventions:
+        ivs = [(int(i.feature_id), float(i.scale)) for i in cmd.interventions]
+    elif cmd.feature_id is not None:
+        ivs = [(int(cmd.feature_id), float(cmd.scale or 0.0))]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide `interventions` or legacy `feature_id` + `scale`",
+        )
+    # Drop observation-only (zero-scale) interventions before running.
+    ivs = [(f, s) for (f, s) in ivs if s != 0.0]
+    if not ivs:
+        raise HTTPException(status_code=422, detail="No non-zero interventions to run")
+
     # Clamp to sane bounds (cost grows linearly in both).
     n_steps = max(1, min(int(cmd.n_steps), 40))
     n_seeds = max(1, min(int(cmd.n_seeds), 4))
     try:
         result = await loop.run_in_executor(
-            None, engine.run_rollout, int(cmd.feature_id), float(cmd.scale), n_steps, n_seeds
+            None, engine.run_rollout, ivs, n_steps, n_seeds
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -279,6 +310,112 @@ async def delete_bookmark(
     """Delete one feature bookmark."""
     existed = bookmarks.delete(env_id, layer, feature_id)
     return {"status": "ok", "deleted": existed}
+
+
+# ---------------------------------------------------------------------------
+# Pinned features (v2 canvas state — feature cards with scale + position)
+# ---------------------------------------------------------------------------
+
+class PinnedModel(BaseModel):
+    env_id: str
+    layer: int
+    feature_id: int
+    # All optional: a partial update changes only the fields it includes (the
+    # store keeps the rest). Omit a field to leave it untouched; send custom_label=""
+    # to clear a label. intervention_scale 0 = pinned for observation, not steering.
+    custom_label: Optional[str] = None
+    intervention_scale: Optional[float] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
+
+
+@app.get("/pinned")
+async def list_pinned(
+    env_id: Optional[str] = Query(None),
+    layer: Optional[int] = Query(None),
+) -> List[dict]:
+    """Return pinned canvas features, optionally filtered by env_id and/or layer."""
+    return pinned.list(env_id=env_id, layer=layer)
+
+
+@app.post("/pinned")
+async def upsert_pinned(item: PinnedModel) -> dict:
+    """Pin a feature or partially update an existing pin (add / rename / move / set scale).
+
+    Merge semantics: only fields actually present in the request body are applied, so the
+    canvas can PATCH-style update one aspect (drag → x/y, slider → scale) without clobbering
+    the others.
+    """
+    from datetime import datetime, timezone
+    sent = item.model_dump(exclude_unset=True)
+    rec = pinned.upsert(
+        env_id=item.env_id,
+        layer=item.layer,
+        feature_id=item.feature_id,
+        custom_label=sent.get("custom_label", _UNSET),
+        intervention_scale=sent.get("intervention_scale", _UNSET),
+        x=sent.get("x", _UNSET),
+        y=sent.get("y", _UNSET),
+        updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    return {"status": "ok", "pinned": rec}
+
+
+@app.delete("/pinned")
+async def delete_pinned(
+    env_id: str = Query(...),
+    layer: int = Query(...),
+    feature_id: int = Query(...),
+) -> dict:
+    """Unpin one feature (remove its card from the canvas)."""
+    existed = pinned.delete(env_id, layer, feature_id)
+    return {"status": "ok", "deleted": existed}
+
+
+# ---------------------------------------------------------------------------
+# Autointerp feature labels (read-only; populated offline by scripts/autointerp.py)
+# ---------------------------------------------------------------------------
+
+@app.get("/feature/{feature_id}")
+async def get_feature(
+    feature_id: int,
+    layer: Optional[int] = Query(None),
+) -> dict:
+    """Return one SAE feature's autointerp record: label + firing stats + example frames.
+
+    Reads the cache written by ``scripts/autointerp.py``. If the pipeline hasn't been run
+    (or this feature is dead/unlabeled), returns ``label: null`` and no examples — the UI
+    shows 'unlabeled'. ``layer`` is inferred when a single cache exists; otherwise pass it.
+    """
+    from fastapi import HTTPException
+    resolved = resolve_layer(SAE_DIR, layer if layer is not None else engine.sae_layer)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No autointerp cache found — run scripts/autointerp.py, or pass ?layer=",
+        )
+    return AutoInterpStore(SAE_DIR, resolved).read_feature(feature_id)
+
+
+@app.get("/features")
+async def list_features(
+    layer: Optional[int] = Query(None),
+    labeled_only: bool = Query(False),
+) -> dict:
+    """Return the whole autointerp index (light: labels + stats, no images).
+
+    Drives the v2 label-keyword search. ``{layer, env_id, features: {id: {...}}}`` or an
+    empty ``features`` map when the pipeline hasn't run.
+    """
+    resolved = resolve_layer(SAE_DIR, layer if layer is not None else engine.sae_layer)
+    if resolved is None:
+        return {"layer": None, "features": {}}
+    index = AutoInterpStore(SAE_DIR, resolved).load_index()
+    if labeled_only:
+        index = {**index, "features": {
+            k: v for k, v in (index.get("features") or {}).items() if v.get("label")
+        }}
+    return index
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
-  "name": "wm-visualizer-frontend-v2",
-  "version": "0.2.0",
+  "name": "wm-visualizer-frontend",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -24,11 +24,9 @@
     "d3-scale": "^4.0.2",
     "d3-selection": "^3.0.0",
     "d3-transition": "^3.0.1",
-    "konva": "^9.3.0",
     "next": "14.2.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-konva": "^18.2.10"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.4.5",

@@ -20,17 +20,10 @@ export interface RolloutFrame {
   state: FrameState;
 }
 
-/** One feature's contribution to a (possibly multi-feature) intervention. */
-export interface Intervention {
-  feature_id: number;
-  scale: number;
-}
-
 /** Result of POST /rollout: paired baseline vs intervened, one entry per seed per step. */
 export interface RolloutResult {
-  feature_id: number; // legacy: first active feature (back-compat with v1)
+  feature_id: number;
   scale: number;
-  interventions?: Intervention[]; // v2: every feature actually applied this rollout
   layer: number;
   n_steps: number;
   n_seeds: number;
@@ -86,35 +79,10 @@ export function useRollout() {
     [],
   );
 
-  const runMulti = useCallback(
-    async (interventions: Intervention[], nSteps = 20, nSeeds = 2) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch(`${API_BASE}/rollout`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ interventions, n_steps: nSteps, n_seeds: nSeeds }),
-        });
-        if (!res.ok) {
-          const detail = await res.json().catch(() => ({}));
-          throw new Error(detail.detail || `rollout failed (${res.status})`);
-        }
-        setResult(await res.json());
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-        setResult(null);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
-
   const clear = useCallback(() => {
     setResult(null);
     setError(null);
   }, []);
 
-  return { result, loading, error, run, runMulti, clear };
+  return { result, loading, error, run, clear };
 }
