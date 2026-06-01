@@ -126,6 +126,16 @@ Working hypothesis: temporal stability × causal importance, combined, will prod
 
 Plan: implement temporal stability as the immediate fix (small backend change, makes the discovery panel less churny). Implement causal importance as an offline pipeline (one rollout per feature, ~44 hours on CPU or ~22 on MPS, runs overnight). Surface both rankings as alternate views in the discovery panel. Document both as findings.
 
+### Implementation — temporal stability (done)
+
+Built as a small engine change: a rolling 60-frame window of the full per-feature activation vector (`_sae_history`, written each frame in `_compute_sae_features`), exposed via `GET /ranking/stability`. The discovery panel gained a metric toggle (`firing` / `stable` / `causal`), and "stable" polls the endpoint live (1.5s) so it reflects the recent window.
+
+**Design decision — rank by coefficient of variation, not raw variance.** The literal spec ("lower variance = higher rank") is degenerate: a permanently-OFF feature has variance 0 and would top the ranking while meaning nothing. Two changes fix it: (1) gate on a firing-rate floor (default 0.2) so features must actually fire in the window to be ranked, and (2) rank by ascending coefficient of variation (std/mean) rather than raw variance, which is scale-invariant — a feature that fires steadily at magnitude 0.5 and one that fires steadily at 3.0 are both "stable," and CV says so while raw variance would over-rank the small-magnitude one. The display score is `1/(1+CV)` so higher reads as more stable, matching the firing-magnitude bars' direction.
+
+This is the first concrete instance of the project's thesis: importing the LLM convention naively (rank by a magnitude statistic) produces a broken ranking on the world-model substrate, and the fix requires a substrate-aware metric. The dead-feature degeneracy is logged in FINDINGS.
+
+Causal importance is the next piece (offline pipeline); comparative results between the three rankings go here once it has run.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.

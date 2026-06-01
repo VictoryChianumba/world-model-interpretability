@@ -28,6 +28,14 @@ Better candidates: temporal stability (features that fire consistently across ma
 
 **Implication:** importing LLM SAE conventions directly into world model interpretability tooling produces broken UX. Importance metrics need to be adapted to the substrate.
 
+### Edge case — "rank by low firing-rate variance" is degenerate without a firing-rate floor
+
+When implementing temporal-stability ranking (rank features that fire consistently above features that flicker), the obvious metric — lowest variance of activation over a window — is degenerate. A permanently-OFF feature has variance exactly 0, so a naive low-variance ranking surfaces dead features at the top: maximally "stable," entirely meaningless. SAEs have many dead/rare features, so this isn't a corner case; it dominates the ranking.
+
+Two fixes, both needed: (1) gate candidates on a firing-rate floor (a feature must be active in at least X% of the window, default 20%, to be ranked at all), and (2) rank by coefficient of variation (std/mean) rather than raw variance. CV is scale-invariant, so a feature firing steadily at low magnitude and one firing steadily at high magnitude are scored equally stable — whereas raw variance conflates "low magnitude" with "stable" and over-ranks weak features.
+
+**Implication:** any "consistency" or "stability" importance metric on a sparse-feature substrate needs an activity gate, because the silent majority of features are inactive and inactivity reads as perfect stability. State the gate explicitly; it changes which features the ranking is even considering.
+
 ## Soft routing in MoE-style SAEs leaks signal into the gating mechanism
 
 *(Carried from the previous factored-SAE project; relevant context here.)*

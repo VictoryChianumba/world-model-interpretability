@@ -397,6 +397,20 @@ async def get_feature(
     return AutoInterpStore(SAE_DIR, resolved).read_feature(feature_id)
 
 
+@app.get("/ranking/stability")
+async def ranking_stability(
+    top: int = Query(20, ge=1, le=200),
+    min_firing: float = Query(0.2, ge=0.0, le=1.0),
+) -> dict:
+    """Rank SAE features by temporal stability over the recent live frame window.
+
+    A world-model-adapted alternative to top-K-by-magnitude: features that fire
+    *consistently* across frames (low coefficient of variation) over flickery ones.
+    Computed from the engine's rolling buffer, so it reflects the last ~N streamed frames.
+    """
+    return engine.get_feature_stability(top=top, min_firing=min_firing)
+
+
 @app.get("/features")
 async def list_features(
     layer: Optional[int] = Query(None),

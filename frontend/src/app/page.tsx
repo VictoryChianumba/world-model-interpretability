@@ -17,6 +17,7 @@ import { useRollout, type Intervention } from "@/hooks/useRollout";
 import { usePinned } from "@/hooks/usePinned";
 import { useFeatureIndex } from "@/hooks/useFeatureIndex";
 import { useActivationHistory } from "@/hooks/useActivationHistory";
+import { useFeatureRanking, type RankingMetric } from "@/hooks/useFeatureRanking";
 import { API_BASE } from "@/lib/config";
 
 // react-konva touches `window` at import → load the canvas client-side only.
@@ -33,6 +34,7 @@ export default function Home() {
   const [view, setView] = useState<"canvas" | "internals">("canvas");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [paused, setPaused] = useState(false);
+  const [rankingMetric, setRankingMetric] = useState<RankingMetric>("firing");
 
   useEffect(() => {
     fetch(`${API_BASE}/devices`)
@@ -88,6 +90,7 @@ export default function Home() {
   const { features, loaded: indexLoaded, labelFor: autoLabelFor, search } = useFeatureIndex(saeLayer);
   const { labelFor: bookmarkLabelFor } = useBookmarks(envId, saeLayer);
   const { historyFor, currentFor } = useActivationHistory(state.sae_features, state.metrics?.step);
+  const ranking = useFeatureRanking(rankingMetric, state.sae_features, saeLayer);
 
   // Resolve a card's display label: user override → autointerp → bookmark → null.
   const resolveLabel = useCallback(
@@ -188,7 +191,11 @@ export default function Home() {
               </div>
               <div className="min-h-0 flex-1">
                 <DiscoveryPanel
-                  features={state.sae_features}
+                  metric={rankingMetric}
+                  onMetricChange={setRankingMetric}
+                  items={ranking.items}
+                  available={ranking.available}
+                  note={ranking.note}
                   labelFor={discoveryLabelFor}
                   onPin={pin}
                   isPinned={isPinned}
