@@ -36,39 +36,62 @@ class IrisHookExtractor:
 
     def __init__(self) -> None:
         self._handles: list = []
+        self._num_block_layers: int = 0          # transformer depth (independent of handle count)
         self._attn_data: Dict[int, torch.Tensor] = {}
         self._norms_data: Dict[int, torch.Tensor] = {}  # 0-d tensors; .item() deferred to consumer
+        self._resid_layer: Optional[int] = None  # layer whose full residual we capture (SAE), or None
+        self._resid_data: Optional[torch.Tensor] = None  # (1, T, E) full residual at _resid_layer
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def attach(self, world_model) -> None:
+    def attach(self, world_model, capture_resid_layer: Optional[int] = None) -> None:
         """
         Register hooks on every transformer Block.
+
+        If ``capture_resid_layer`` is given, an extra forward hook on that block
+        captures its full residual-stream output (1, T, E) each pass — the input
+        the SAE encoder reads.  This is a read-only capture on the existing
+        no-cache extraction pass; it adds no world-model forward passes.
 
         On any failure the method removes all already-registered hooks before
         re-raising so the model is always left in a clean state.
         """
+        blocks = world_model.transformer.blocks
+        num_layers = len(blocks)
+        if capture_resid_layer is not None and not (0 <= capture_resid_layer < num_layers):
+            raise ValueError(
+                f"capture_resid_layer={capture_resid_layer} out of range [0, {num_layers})"
+            )
+
         handles: list = []
         try:
-            for i, block in enumerate(world_model.transformer.blocks):
+            for i, block in enumerate(blocks):
                 h_attn = block.attn.attn_drop.register_forward_hook(
                     self._make_attn_hook(i)
                 )
                 handles.append(h_attn)
                 h_norm = block.register_forward_hook(self._make_norm_hook(i))
                 handles.append(h_norm)
+            if capture_resid_layer is not None:
+                h_resid = blocks[capture_resid_layer].register_forward_hook(
+                    self._make_resid_hook()
+                )
+                handles.append(h_resid)
         except Exception as exc:
             for h in handles:
                 h.remove()
             raise RuntimeError(f"Hook registration failed: {exc}") from exc
 
         self._handles = handles
+        self._num_block_layers = num_layers
+        self._resid_layer = capture_resid_layer
         logger.info(
-            "Attached %d hook pairs to %d transformer layers",
-            len(handles) // 2,
-            len(world_model.transformer.blocks),
+            "Attached hooks to %d transformer layers%s",
+            num_layers,
+            f" (+ residual capture at layer {capture_resid_layer})"
+            if capture_resid_layer is not None else "",
         )
 
     def detach(self) -> None:
@@ -76,6 +99,9 @@ class IrisHookExtractor:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        self._num_block_layers = 0
+        self._resid_layer = None
+        self._resid_data = None
         self._attn_data.clear()
         self._norms_data.clear()
         logger.info("Detached all hooks")
@@ -96,15 +122,23 @@ class IrisHookExtractor:
             return None, None
         return dict(self._attn_data), dict(self._norms_data)
 
+    def get_resid(self) -> Optional[torch.Tensor]:
+        """Return the full residual (1, T, E) captured at the SAE layer, or None.
+
+        None if no residual layer was requested or no forward pass has run yet.
+        """
+        return self._resid_data
+
     def clear(self) -> None:
         """Discard cached data without removing hooks."""
         self._attn_data.clear()
         self._norms_data.clear()
+        self._resid_data = None
 
     @property
     def num_layers(self) -> int:
-        """Number of layers currently hooked (0 if not attached)."""
-        return len(self._handles) // 2
+        """Number of transformer layers currently hooked (0 if not attached)."""
+        return self._num_block_layers
 
     # ------------------------------------------------------------------
     # Hook factories
@@ -130,4 +164,12 @@ class IrisHookExtractor:
             # GPU→CPU sync on every layer inside the forward pass.  The consumer
             # (inference.py) calls .item() once, after the full forward completes.
             self._norms_data[layer_idx] = out[0, -1].norm().detach()
+        return hook
+
+    def _make_resid_hook(self):
+        def hook(module: nn.Module, inp: tuple, out: torch.Tensor) -> None:
+            # out: (B, T, embed_dim) — full residual stream after the SAE layer.
+            # Store the whole tensor (not just a norm) so the SAE encoder can read
+            # any token position.  .detach() only — kept on device; no sync here.
+            self._resid_data = out.detach()
         return hook

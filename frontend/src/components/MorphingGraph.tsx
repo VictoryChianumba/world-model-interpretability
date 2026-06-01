@@ -297,9 +297,18 @@ export default function MorphingGraph({
     // ---- Update force link and soft-restart → morph to new equilibrium ------
     const sim = simRef.current;
     if (sim) {
-      (sim.force("link") as ForceLink<NodeDatum, EdgeDatum>).links(edges);
+      const linkForce = sim.force<ForceLink<NodeDatum, EdgeDatum>>("link");
+      linkForce?.links(edges);
       sim.alpha(0.12).restart();
     }
+
+    // Capture the SVG element so the cleanup closure doesn't need svgRef.
+    const svgEl = svgRef.current;
+    return () => {
+      // Interrupt any in-flight D3 transitions so stale callbacks don't try
+      // to update the DOM after deps have already changed or the component unmounts.
+      select(svgEl).selectAll<Element, unknown>("*").interrupt();
+    };
   }, [attention, selectedLayer, tokenLayout]);
 
   // -------------------------------------------------------------------------

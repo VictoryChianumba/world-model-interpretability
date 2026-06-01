@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from inference import InferenceEngine
+from bookmarks import BookmarkStore
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -47,7 +48,11 @@ CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
     str(Path(IRIS_ROOT) / "checkpoints"),
 )
+# Directory scanned for trained sae_L*.pt artifacts (defaults to CHECKPOINT_DIR)
+SAE_DIR = os.environ.get("SAE_DIR", CHECKPOINT_DIR)
 DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "cpu")
+# JSON store for SAE feature bookmarks (the backend's only persistence)
+BOOKMARKS_PATH = os.environ.get("BOOKMARKS_PATH", str(Path(SAE_DIR) / "bookmarks.json"))
 
 # Map checkpoint stem → Atari env ID (fallback: append NoFrameskip-v4)
 _KNOWN_ENV_IDS: Dict[str, str] = {
@@ -78,7 +83,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-engine = InferenceEngine(iris_src=IRIS_SRC, iris_root=IRIS_ROOT)
+engine = InferenceEngine(iris_src=IRIS_SRC, iris_root=IRIS_ROOT, sae_dir=SAE_DIR)
+bookmarks = BookmarkStore(BOOKMARKS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +107,9 @@ async def list_agents() -> List[dict]:
     if ckpt_dir.is_dir():
         for pt in sorted(ckpt_dir.glob("*.pt")):
             stem = pt.stem
+            # Skip SAE artifacts that share the checkpoint dir — they are not agents.
+            if stem.startswith("sae_"):
+                continue
             agents.append({
                 "id": stem,
                 "name": stem,
@@ -135,7 +144,7 @@ async def get_config() -> dict:
 
 
 class ControlCommand(BaseModel):
-    command: str                          # loop | restart | pause | resume | switch_agent
+    command: str                          # loop | restart | pause | resume | step | set_intervention | switch_agent
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -164,6 +173,17 @@ async def control(cmd: ControlCommand) -> dict:
     elif cmd.command == "resume":
         engine.resume()
 
+    elif cmd.command == "step":
+        engine.step_once()
+
+    elif cmd.command == "set_intervention":
+        p = cmd.payload or {}
+        fid = p.get("feature_id")
+        engine.set_intervention(
+            int(fid) if fid is not None else None,
+            float(p.get("scale", 0.0)),
+        )
+
     elif cmd.command == "switch_agent":
         p = cmd.payload or {}
         ckpt = Path(p["checkpoint_path"])
@@ -178,6 +198,55 @@ async def control(cmd: ControlCommand) -> dict:
         return {"status": "error", "detail": f"Unknown command: {cmd.command!r}"}
 
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Bookmarks (SAE feature labels — the only persisted state)
+# ---------------------------------------------------------------------------
+
+class BookmarkModel(BaseModel):
+    env_id: str
+    layer: int
+    feature_id: int
+    label: str
+    notes: str = ""
+    source: str = "user"
+
+
+@app.get("/bookmarks")
+async def list_bookmarks(
+    env_id: Optional[str] = Query(None),
+    layer: Optional[int] = Query(None),
+) -> List[dict]:
+    """Return saved feature bookmarks, optionally filtered by env_id and/or layer."""
+    return bookmarks.list(env_id=env_id, layer=layer)
+
+
+@app.post("/bookmarks")
+async def upsert_bookmark(item: BookmarkModel) -> dict:
+    """Create or update one feature bookmark (keyed by env_id+layer+feature_id)."""
+    from datetime import datetime, timezone
+    rec = bookmarks.upsert(
+        env_id=item.env_id,
+        layer=item.layer,
+        feature_id=item.feature_id,
+        label=item.label,
+        notes=item.notes,
+        source=item.source,
+        updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    return {"status": "ok", "bookmark": rec}
+
+
+@app.delete("/bookmarks")
+async def delete_bookmark(
+    env_id: str = Query(...),
+    layer: int = Query(...),
+    feature_id: int = Query(...),
+) -> dict:
+    """Delete one feature bookmark."""
+    existed = bookmarks.delete(env_id, layer, feature_id)
+    return {"status": "ok", "deleted": existed}
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +327,79 @@ async def websocket_handler(
         logger.error("WebSocket error: %s", exc)
     finally:
         engine.unregister_event_callback(event_cb)
+
+
+@app.websocket("/ws/latent")
+async def websocket_latent_handler(
+    ws: WebSocket,
+    agent: Optional[str] = Query(None),
+    env_id: Optional[str] = Query(None),
+    device: Optional[str] = Query(None),
+) -> None:
+    """
+    WebSocket endpoint for the latent-space reconstruction page.
+
+    Identical frame stream to /ws, but registers the client as a latent
+    subscriber so the inference loop computes reconstruction decode only
+    while at least one client is connected here.
+    """
+    await ws.accept()
+    engine.add_latent_subscriber()
+    loop = asyncio.get_event_loop()
+
+    from queue import Queue as SyncQueue
+    event_q: SyncQueue = SyncQueue()
+
+    def event_cb(event_name: str, data: dict) -> None:
+        event_q.put_nowait({"type": "event", "event": event_name, "data": data})
+
+    engine.register_event_callback(event_cb)
+
+    if agent and not engine.is_running:
+        ckpt_path = _resolve_checkpoint(agent)
+        resolved_env = env_id or _infer_env_id(agent)
+        resolved_dev = device or DEFAULT_DEVICE
+        try:
+            await loop.run_in_executor(
+                None, engine.start, ckpt_path, resolved_env, resolved_dev
+            )
+        except Exception as exc:
+            await ws.send_json({
+                "type": "event",
+                "event": "error",
+                "data": {"message": str(exc)},
+            })
+            engine.unregister_event_callback(event_cb)
+            engine.remove_latent_subscriber()
+            return
+
+    cfg = engine.get_config()
+    agents_list = await list_agents()
+    await ws.send_json({
+        "type": "config",
+        **cfg,
+        "agents": agents_list,
+    })
+
+    try:
+        while True:
+            while not event_q.empty():
+                try:
+                    await ws.send_json(event_q.get_nowait())
+                except Empty:
+                    break
+
+            frame = await loop.run_in_executor(None, engine.get_latent_frame, 0.05)
+            if frame is not None:
+                await ws.send_json(frame)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket latent client disconnected")
+    except Exception as exc:
+        logger.error("WebSocket latent error: %s", exc)
+    finally:
+        engine.unregister_event_callback(event_cb)
+        engine.remove_latent_subscriber()
 
 
 # ---------------------------------------------------------------------------

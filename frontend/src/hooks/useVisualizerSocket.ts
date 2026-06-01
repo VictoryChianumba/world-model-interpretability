@@ -37,12 +37,26 @@ export interface AgentInfo {
   env_id: string;
 }
 
+export interface SAEFeature {
+  id: number;       // feature index in the SAE dictionary
+  mag: number;      // activation magnitude (post-ReLU)
+}
+
 export interface FrameData {
   frame: string;                                  // base64 PNG
   attention: Record<string, number[][][]>;        // layer_idx → [nh][T_q][T_k]
   norms: number[];                                // per layer
   metrics: Metrics;
   token_layout: TokenLayout;
+  reconstruction: string | null;                  // base64 PNG or null
+  error_map: string | null;                       // base64 grayscale PNG or null
+  reconstruction_error: number | null;            // MAE in [0, 255] or null
+  imagined_next: string | null;                   // base64 PNG: WM-predicted next frame (step mode only)
+  sae_features: SAEFeature[] | null;              // top-K firing features this frame, or null
+  sae_layer: number | null;                       // WM layer the SAE reads, or null if no SAE
+  imagined_intervened: string | null;             // base64 PNG: intervened next frame (step mode)
+  intervention_diff: string | null;               // base64 grayscale PNG: |baseline - intervened|
+  intervention: { feature_id: number; scale: number; n_changed: number | null } | null;  // active intervention, or null
 }
 
 export interface EventMessage {
@@ -62,10 +76,26 @@ export interface VisualizerState {
   token_layout: TokenLayout | null;
   config: (ModelConfig & { agents: AgentInfo[] }) | null;
   events: EventMessage[];
+  reconstruction: string | null;
+  error_map: string | null;
+  reconstruction_error: number | null;
+  imagined_next: string | null;
+  sae_features: SAEFeature[] | null;
+  sae_layer: number | null;
+  imagined_intervened: string | null;
+  intervention_diff: string | null;
+  intervention: { feature_id: number; scale: number; n_changed: number | null } | null;
 }
 
 export interface ControlCommand {
-  command: "loop" | "restart" | "pause" | "resume" | "switch_agent";
+  command:
+    | "loop"
+    | "restart"
+    | "pause"
+    | "resume"
+    | "step"
+    | "set_intervention"
+    | "switch_agent";
   payload?: Record<string, unknown>;
 }
 
@@ -75,10 +105,10 @@ export interface ControlCommand {
 
 const RECONNECT_DELAY_MS = 2_000;
 const MAX_EVENTS = 200;
-const WS_URL =
+const WS_BASE =
   typeof window !== "undefined"
-    ? `ws://${window.location.hostname}:8000/ws`
-    : "ws://localhost:8000/ws";
+    ? `ws://${window.location.hostname}:8000`
+    : "ws://localhost:8000";
 const API_BASE =
   typeof window !== "undefined"
     ? `http://${window.location.hostname}:8000`
@@ -94,6 +124,7 @@ export function useVisualizerSocket(
   agentName?: string,
   envId?: string,
   device?: string,
+  wsPath: string = "/ws",
 ): {
   state: VisualizerState;
   sendControl: (cmd: ControlCommand) => Promise<void>;
@@ -108,6 +139,15 @@ export function useVisualizerSocket(
     token_layout: null,
     config: null,
     events: [],
+    reconstruction: null,
+    error_map: null,
+    reconstruction_error: null,
+    imagined_next: null,
+    sae_features: null,
+    sae_layer: null,
+    imagined_intervened: null,
+    intervention_diff: null,
+    intervention: null,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -133,12 +173,12 @@ export function useVisualizerSocket(
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
 
-    let url = WS_URL;
+    let url = `${WS_BASE}${wsPath}`;
     if (agentName) {
       const params = new URLSearchParams({ agent: agentName });
       if (envId) params.set("env_id", envId);
       if (device) params.set("device", device);
-      url = `${WS_URL}?${params}`;
+      url = `${url}?${params}`;
     }
 
     setState((prev) => ({ ...prev, loading: true }));
@@ -202,6 +242,18 @@ export function useVisualizerSocket(
               prev.token_layout.labels.join("\0")
               ? prev.token_layout
               : f.token_layout,
+          reconstruction: f.reconstruction ?? null,
+          error_map: f.error_map ?? null,
+          reconstruction_error: f.reconstruction_error ?? null,
+          // Only populated on a single-step; preserve the last imagined frame
+          // across free-running frames so the panel doesn't flicker to empty.
+          imagined_next: f.imagined_next ?? prev.imagined_next,
+          sae_features: f.sae_features ?? null,
+          sae_layer: f.sae_layer ?? null,
+          // Intervention outputs are step-mode only; preserve across free-run frames.
+          imagined_intervened: f.imagined_intervened ?? prev.imagined_intervened,
+          intervention_diff: f.intervention_diff ?? prev.intervention_diff,
+          intervention: f.intervention ?? prev.intervention,
         }));
       } else if (type === "config") {
         const cfg = msg as unknown as Partial<ModelConfig> & {
@@ -241,11 +293,20 @@ export function useVisualizerSocket(
             frame: null,
             attention: null,
             norms: null,
+            reconstruction: null,
+            error_map: null,
+            reconstruction_error: null,
+            imagined_next: null,
+            sae_features: null,
+            sae_layer: null,
+            imagined_intervened: null,
+            intervention_diff: null,
+            intervention: null,
           }));
         }
       }
     };
-  }, [agentName, envId, device, addEvent]);
+  }, [agentName, envId, device, wsPath, addEvent]);
 
   // Mount / unmount / agentName change
   useEffect(() => {
