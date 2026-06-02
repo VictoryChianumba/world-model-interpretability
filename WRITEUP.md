@@ -206,6 +206,34 @@ Combined with Test 1 (a one-frame display offset, fixed) and Test 2 (extraction 
 
 **Done:** Δ table committed (`results/test3_collision_correlation.json`); collision-correlated / flat / anti-correlated counts and the magnitude-vs-semantics mismatch written up; ranking stable across 2 episodes.
 
+#### Test 5 — activation-event timing trace
+
+**Question.** Over a full episode, does a feature's activation peak align temporally with on-screen events?
+
+**Method.** `scripts/diagnostics/test5_timing_trace.py`. Trace 5 features over a 1200-frame episode (×2): the Test-3 collision detectors #1199/#120/#1773, the air-flight tracker #1364, and the anti-collision feature #316. Programmatic events: paddle-ball collision (reliable), ball-brick collision (red brick-pixel count drops), ball vertical direction change. Per (feature, event-type) compute an **event lift** = mean activation in a ±1 window around events ÷ episode-mean activation. Plots saved to `results/test5_timing_ep{0,1}.png`.
+
+**Result (paddle-collision lift, ep0 / ep1):**
+
+| feature | role (Test 3) | lift ep0 | lift ep1 | verdict |
+|--------:|---------------|---------:|---------:|---------|
+| #1199 | collision | **5.8×** | **6.4×** | genuine collision detector (consistent) |
+| #120  | collision | **3.7×** | **4.5×** | genuine collision detector (consistent) |
+| #1773 | collision (by Δ) | 1.0× | 0.3× | **inconsistent** — not a per-collision detector |
+| #1364 | air tracker | 0.95× | 1.0× | no collision lift (confirms air, not collision) |
+| #316  | anti-collision | **0.17×** | **0.17×** | suppressed at collisions (consistent) |
+
+The traces (see `test5_timing_ep0.png`) make the mechanism visible: **#1199 and #120 fire as discrete spikes locked to the collision markers** — the clearest "this feature detects this event" evidence in the battery. **#1773 and #1364 instead fire in sustained multi-frame blocks** (a game-phase/state signal, not an event spike). Brick-destruction and direction-change events were too sparse/unreliable to analyze (the agent rarely cleared bricks, and the red-only brick counter is partial); conclusions are limited to paddle collisions.
+
+**Interpretation.** Two things. First, **strong confirmation**: #1199 and #120 are real collision detectors (4–6× lift, reproducible), #1364 and #316 are confirmed *not* collision features — exactly as Test 3 implied. Second, a **methodological catch**: #1773 scored as collision-correlated by Test 3's group mean (Δ +1.13) but shows no reliable per-event lift (1.0×, 0.3×). The trace explains it — #1773 is active in a sustained block, and Test 3's 20 sampled collision frames happened to fall inside that block, inflating its group mean. Per-event timing disambiguates "fires *at* the event" from "is active during a window that *contains* the event." The single-measurement discipline (2 episodes) is what surfaced it: #1199/#120/#316 held across episodes, #1773 did not.
+
+**Done:** traces plotted (2 episodes); paddle-collision lift table committed (`results/test5_timing_trace.json`); #1199/#120 confirmed as collision detectors, #1773 demoted, #1364/#316 confirmed non-collision; cross-episode consistency reported.
+
+#### Battery outcome
+
+Tests 1–3 (with 5 confirming) answer the original question. The apparent feature–event decoupling had two real causes, neither being "the features are broken": (1) a one-frame display offset between the frame and its activations (Test 1, fixed); (2) the discovery panel's default magnitude ranking surfaces *persistent* features (e.g. the air-flight tracker #1364, the single most-active feature) rather than *event* features (the collision detectors #1199/#120, which are real and robust but rank lower because brief events accumulate less total activity). Extraction is exact (Test 2), so nothing is being mis-measured. **Test 4 (causal intervention specificity) is therefore deprioritized per the brief's own guidance** — the question is resolved without it; it would add confirmatory depth (does intervening on #1364 move the ball vs the paddle?) but is the most expensive test and currently competes for compute with the full causal run. It remains a clean follow-up.
+
+**Resolution of the standing open question** ("is activation magnitude a reasonable feature-importance signal for world models?"): **No, with evidence.** Not because features lack meaning — they correlate with events strongly and reproducibly — but because magnitude ranks by duration×strength of firing, so it surfaces persistent trackers over event detectors. The semantic feature a user expects to see for a brief event sits below a continuously-firing feature. Temporal-stability ranking surfaced the event/semantic features better here (4 of its top 5 were collision-correlated). The sub-question that remains open: *which* substrate-adapted ranking (stability vs causal vs an event-conditioned Δ) is best, and whether that holds beyond Breakout layer 5 — now a concrete, testable question rather than a vague worry.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.
