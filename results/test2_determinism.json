@@ -1,0 +1,38 @@
+{
+  "train_flags": {
+    "world_model.training": false,
+    "tokenizer.training": false,
+    "sae.training": false
+  },
+  "deterministic_bit_exact": true,
+  "frames": [
+    {
+      "frame": 0,
+      "n_features": 2048,
+      "repeats": 10,
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "n_features_diff_gt_1e-6": 0,
+      "n_active_in_ref": 8
+    },
+    {
+      "frame": 1,
+      "n_features": 2048,
+      "repeats": 10,
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "n_features_diff_gt_1e-6": 0,
+      "n_active_in_ref": 18
+    },
+    {
+      "frame": 2,
+      "n_features": 2048,
+      "repeats": 10,
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "n_features_diff_gt_1e-6": 0,
+      "n_active_in_ref": 8
+    }
+  ],
+  "verdict": "bit-exact deterministic across all repeats and frames"
+}

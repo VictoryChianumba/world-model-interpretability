@@ -167,6 +167,18 @@ A diagnostic batch run to resolve an observation made while using the tool: SAE 
 
 **Done:** frame–activation drift detected (one-frame semantic offset) and fixed by pre-step capture; multi-message/render drift ruled out across 600 frames; 2 episodes agree.
 
+#### Test 2 — activation determinism
+
+**Question.** Given the same input frame, does the SAE produce the same activation vector on repeated forward passes, or is there extraction noise?
+
+**Method.** `scripts/diagnostics/test2_determinism.py` replicates `_compute_sae_features` exactly (encode obs → WM forward with a residual hook on the SAE layer → normalise the action-token vector → SAE.encode) on a *fixed* `(obs_tokens, action)` input — the action fixed too, since the SAE reads the action-token position — repeated 10× on each of 3 distinct game states. Diff every repeat against the first across all 2048 features.
+
+**Result.** Bit-exact deterministic: max |Δ| = 0.0, mean |Δ| = 0.0, and 0 of 2048 features with |Δ| > 1e-6, on every frame and repeat. `world_model.training`, `tokenizer.training`, and `sae.training` all `False` (eval mode confirmed, dropout off). Active feature counts at the action token were 8–18 of 2048, consistent with the SAE's measured sparsity (L0 ≈ 14–15).
+
+**Interpretation.** Extraction noise (case b) is ruled out — repeated extraction on identical input is exactly reproducible, so any feature–event decoupling is a property of *what the features represent*, not jitter in measuring them. Caveat: verified on CPU; MPS/CUDA can introduce nondeterministic reductions, but the live extraction runs the same code path and the eval-mode flags hold regardless of device. With Tests 1 and 2 done, the two *mechanical* explanations (display-pipeline timing beyond the fixed one-frame offset, and extraction noise) are eliminated; the remaining candidates (c/d/e — wrong labels, features tracking something other than the expected event, or broken/polysemantic features) are about feature *semantics*, which Tests 3–5 measure directly.
+
+**Done:** diff statistics (all zero) recorded; eval-mode confirmed; extraction noise ruled out.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.
