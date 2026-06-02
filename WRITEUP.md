@@ -148,6 +148,94 @@ Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer
 
 **Which ranking is "more interpretable"?** Not yet answerable on this evidence — it needs the autointerp labels (also built, not yet run) so a human can read the top features of each ranking side by side. What the sample *does* show: the three rankings genuinely disagree (firing is unstable frame-to-frame and run-to-run; causal only moderately tracks magnitude), so they are not redundant views — picking the ranking is a real choice, which is why all three are exposed.
 
+### Feature characterization test battery
+
+A diagnostic batch run to resolve an observation made while using the tool: SAE features appearing *decoupled* from on-screen events (firing while the ball is mid-air, flat during paddle-ball collisions). Five tests distinguish the candidate causes — (a) display-pipeline timing, (b) extraction noise, (c) wrong feature labels, (d) features that are semantically real but track something other than the expected event, (e) genuinely broken/polysemantic features. The tests are diagnostic; they do not change the running tool. Single-measurement discipline applies: results that depend on sampling specific frames or rolling out across an episode require ≥2 independent runs.
+
+#### Test 1 — frame/activation synchronization
+
+**Question.** Are the displayed game frame and the SAE activations shown beside it from the same model forward pass?
+
+**Method.** (1) Added a monotonic `frame_index` to every emitted message plus `console.debug` render logging in the frontend. (2) `scripts/diagnostics/test1_frame_sync.py` replicates the engine's per-step sequence and measures the lag between the displayed frame and the obs the activations are computed from: downsample both to 64×64 grayscale and, over candidate lags L ∈ [−2, +2], find the L minimizing mean |display[t] − obs[t+L]|. Run on 2 independent episodes. (3) A 600-frame WebSocket capture checked message-level co-delivery and `frame_index` monotonicity.
+
+**Result — two findings, opposite in sign:**
+
+- *No multi-message drift.* The game frame and activations are not separate messages — they are bundled in one `FrameData` and rendered from one React state update. Over 600 streamed frames every message carried both, with `frame_index` strictly increasing 1→600. The display-pipeline-timing hypothesis (a) is ruled out as a *multi-message / render-batch* problem.
+- *A real one-frame content offset, now fixed.* Within that single message the frame was captured **after** `env.step()` while the activations describe the **pre-step** obs — so the displayed frame led its own activations by exactly one step. The lag diagnostic measured best-lag **+1** for the old post-step capture and **0** for the pre-step capture, identically in both episodes (minimum mean-abs-diff 0.00376 at the aligned lag vs 0.00428 one step off — the whole lag table shifted by one). Fixed by capturing the display frame before `env.step()`; `frame_index` now labels the shared step.
+
+**Interpretation.** This offset is exactly the kind of artifact that reads as "features don't fire during the on-screen collision": when the displayed frame shows the collision, the activations beside it are from the frame just *before* it. It is a genuine bug (not perception bias) and a *partial* explanation of the observation — but only partial: a one-frame shift mis-attributes by one frame, so it cannot by itself account for features that stay flat across an entire multi-frame collision window. Whether features align with events *at all*, after this fix, is what Tests 3 and 5 measure.
+
+**Done:** frame–activation drift detected (one-frame semantic offset) and fixed by pre-step capture; multi-message/render drift ruled out across 600 frames; 2 episodes agree.
+
+#### Test 2 — activation determinism
+
+**Question.** Given the same input frame, does the SAE produce the same activation vector on repeated forward passes, or is there extraction noise?
+
+**Method.** `scripts/diagnostics/test2_determinism.py` replicates `_compute_sae_features` exactly (encode obs → WM forward with a residual hook on the SAE layer → normalise the action-token vector → SAE.encode) on a *fixed* `(obs_tokens, action)` input — the action fixed too, since the SAE reads the action-token position — repeated 10× on each of 3 distinct game states. Diff every repeat against the first across all 2048 features.
+
+**Result.** Bit-exact deterministic: max |Δ| = 0.0, mean |Δ| = 0.0, and 0 of 2048 features with |Δ| > 1e-6, on every frame and repeat. `world_model.training`, `tokenizer.training`, and `sae.training` all `False` (eval mode confirmed, dropout off). Active feature counts at the action token were 8–18 of 2048, consistent with the SAE's measured sparsity (L0 ≈ 14–15).
+
+**Interpretation.** Extraction noise (case b) is ruled out — repeated extraction on identical input is exactly reproducible, so any feature–event decoupling is a property of *what the features represent*, not jitter in measuring them. Caveat: verified on CPU; MPS/CUDA can introduce nondeterministic reductions, but the live extraction runs the same code path and the eval-mode flags hold regardless of device. With Tests 1 and 2 done, the two *mechanical* explanations (display-pipeline timing beyond the fixed one-frame offset, and extraction noise) are eliminated; the remaining candidates (c/d/e — wrong labels, features tracking something other than the expected event, or broken/polysemantic features) are about feature *semantics*, which Tests 3–5 measure directly.
+
+**Done:** diff statistics (all zero) recorded; eval-mode confirmed; extraction noise ruled out.
+
+#### Test 3 — paddle-ball collision correlation
+
+**Question.** Do features fire more strongly during paddle-ball collisions than during ball-in-air states?
+
+**Method.** `scripts/diagnostics/test3_collision_correlation.py`. Each frame: compute the full 2048-feature vector AND label the frame collision/air/neither. *Labeling note (itself a finding):* the 64×64 model obs cannot resolve the Breakout ball — it is sub-pixel after the resize, so `state_extract` finds nothing (0 balls in 400 frames). Labeling instead uses the full-resolution 210×160 human frame, which depicts the same moment. Ball and paddle are both red (200,72,72); below the brick band (rows 93–184) the only red object is the ball; the paddle is red at rows 185–194. *Collision* = ball there with |ball_x − paddle_x| ≤ 12 px; *air* = ball_y ≤ 150 px. For the top-50 features by overall activity: μ_c (mean activation over collision frames), μ_a (over air frames), Δ = μ_c − μ_a, within-group std. 20 collision + 20 air frames per episode, 2 independent episodes.
+
+**Result.** The Δ ranking is **strongly structured and highly reproducible** — Δ Spearman **+0.977** across the two episodes (47 shared top-50 features), top-10-by-Δ overlap 7/10. Of the top-50 most-active features (episode 0): **15 collision-correlated** (Δ > 0.1), **22 flat** (|Δ| ≤ 0.1), **13 anti-correlated** (Δ < −0.1).
+
+| feature | μ_c | μ_a | Δ | note |
+|--------:|----:|----:|----:|------|
+| #1199 | 1.40 | 0.00 | **+1.40** | fires *only* at collision (std_a = 0) |
+| #120  | 1.23 | 0.05 | +1.19 | collision detector |
+| #1773 | 1.13 | 0.00 | +1.13 | collision detector (also #1 temporal-stability) |
+| #27   | 1.04 | 0.04 | +1.01 | collision detector |
+| #1167 | 0.96 | 0.03 | +0.92 | collision detector |
+| …     |      |      |      | (22 features flat, Δ ≈ 0) |
+| #316  | 0.03 | 0.58 | −0.55 | fires in air |
+| #1364 | 0.82 | 5.57 | **−4.75** | strong **air-flight / ball-tracking** feature |
+
+**Interpretation — this resolves the user's observation, with two distinct causes.** Features are *not* uniformly decoupled from events: clean collision detectors exist (#1199, #120, #1773 fire essentially only at collision), are well-separated (Δ up to +1.4), and are robust across episodes (+0.977). But the feature at the *top of the magnitude ("firing") ranking the discovery panel shows by default* — **#1364, the single most-active feature and the top causal feature from Part VI** — is the most strongly *anti*-collision feature in the battery: μ_a = 5.57 vs μ_c = 0.82. It tracks the ball in mid-flight and goes quiet at the paddle. So a user watching the top-firing feature during a collision sees it stay flat — exactly the reported "feature doesn't fire during the collision." That is not a bug and not perception bias: it is a real ranking mismatch. The collision detectors are real but rank *below* the persistent ball-tracker by magnitude, because a feature that fires throughout flight accumulates more activity than one that fires for the few frames of contact.
+
+Combined with Test 1 (a one-frame display offset, fixed) and Test 2 (extraction is exact), the decoupling is explained: a small genuine display bug, plus the larger fact that **activation magnitude surfaces persistent features (ball-trackers), not event features (collision detectors)** — so the panel's default ranking shows the user a feature whose semantics (mid-air ball tracking) don't match the event they were looking at.
+
+**Cross-link to the rankings (Part VI).** 4 of the 5 most temporally-*stable* features (#27, #1221, #1773, #1789) are in the collision-correlated top-10 — early evidence that temporal stability surfaces semantically-tied features better than magnitude does, while magnitude's #1 (#1364) is semantically an air-tracker. This is consistent with the project's thesis that magnitude is a poor importance signal on this substrate; it is *suggestive*, not settled (one game, one feature-set, the stability↔collision overlap is a single comparison — but the Δ ranking it builds on is reproducible at +0.977).
+
+**Done:** Δ table committed (`results/test3_collision_correlation.json`); collision-correlated / flat / anti-correlated counts and the magnitude-vs-semantics mismatch written up; ranking stable across 2 episodes.
+
+#### Test 5 — activation-event timing trace
+
+**Question.** Over a full episode, does a feature's activation peak align temporally with on-screen events?
+
+**Method.** `scripts/diagnostics/test5_timing_trace.py`. Trace 5 features over a 1200-frame episode (×2): the Test-3 collision detectors #1199/#120/#1773, the air-flight tracker #1364, and the anti-collision feature #316. Programmatic events: paddle-ball collision (reliable), ball-brick collision (red brick-pixel count drops), ball vertical direction change. Per (feature, event-type) compute an **event lift** = mean activation in a ±1 window around events ÷ episode-mean activation. Plots saved to `results/test5_timing_ep{0,1}.png`.
+
+**Result (paddle-collision lift, ep0 / ep1):**
+
+| feature | role (Test 3) | lift ep0 | lift ep1 | verdict |
+|--------:|---------------|---------:|---------:|---------|
+| #1199 | collision | **5.8×** | **6.4×** | genuine collision detector (consistent) |
+| #120  | collision | **3.7×** | **4.5×** | genuine collision detector (consistent) |
+| #1773 | collision (by Δ) | 1.0× | 0.3× | **inconsistent** — not a per-collision detector |
+| #1364 | air tracker | 0.95× | 1.0× | no collision lift (confirms air, not collision) |
+| #316  | anti-collision | **0.17×** | **0.17×** | suppressed at collisions (consistent) |
+
+The traces (see `test5_timing_ep0.png`) make the mechanism visible: **#1199 and #120 fire as discrete spikes locked to the collision markers** — the clearest "this feature detects this event" evidence in the battery. **#1773 and #1364 instead fire in sustained multi-frame blocks** (a game-phase/state signal, not an event spike). Brick-destruction and direction-change events were too sparse/unreliable to analyze (the agent rarely cleared bricks, and the red-only brick counter is partial); conclusions are limited to paddle collisions.
+
+**Interpretation.** Two things. First, **strong confirmation**: #1199 and #120 are real collision detectors (4–6× lift, reproducible), #1364 and #316 are confirmed *not* collision features — exactly as Test 3 implied. Second, a **methodological catch**: #1773 scored as collision-correlated by Test 3's group mean (Δ +1.13) but shows no reliable per-event lift (1.0×, 0.3×). The trace explains it — #1773 is active in a sustained block, and Test 3's 20 sampled collision frames happened to fall inside that block, inflating its group mean. Per-event timing disambiguates "fires *at* the event" from "is active during a window that *contains* the event." The single-measurement discipline (2 episodes) is what surfaced it: #1199/#120/#316 held across episodes, #1773 did not.
+
+**Done:** traces plotted (2 episodes); paddle-collision lift table committed (`results/test5_timing_trace.json`); #1199/#120 confirmed as collision detectors, #1773 demoted, #1364/#316 confirmed non-collision; cross-episode consistency reported.
+
+#### Battery outcome
+
+Tests 1–3 (with 5 confirming) answer the original question. The apparent feature–event decoupling had two real causes, neither being "the features are broken": (1) a one-frame display offset between the frame and its activations (Test 1, fixed); (2) the discovery panel's default magnitude ranking surfaces *persistent* features (e.g. the air-flight tracker #1364, the single most-active feature) rather than *event* features (the collision detectors #1199/#120, which are real and robust but rank lower because brief events accumulate less total activity). Extraction is exact (Test 2), so nothing is being mis-measured.
+
+**Test 4 (causal intervention specificity) is deprioritized — for a principled reason, not only cost.** Its design measures, per intervened feature, the change in *per-object pixel metrics* (Δ_ball_x, Δ_paddle_x, Δ_brick_brightness) across an imagined rollout. But those metrics are exactly what this substrate cannot deliver: Test 3 found the ball is sub-pixel even in the 64×64 model input, and the earlier tokenizer-compression finding showed object positions are not recoverable from the lossy 16-token imagined frames at all. So Test 4 would fall back to token divergence as its only reliable signal — which is precisely what the causal-importance ranking (Part VI) already computes. Running it would re-measure, at higher cost (5 features × 3 scales × 2 frames × 2 seeds = 60 rollouts) and competing with the live causal job, a weaker version of a result we already have, while its distinctive observable (which *object* an intervention moves) is known to be unreliable here. It remains a clean follow-up *if* a higher-resolution decode or a non-pixel object proxy is built first — without that, the test cannot do what it was designed to do.
+
+**Resolution of the standing open question** ("is activation magnitude a reasonable feature-importance signal for world models?"): **No, with evidence.** Not because features lack meaning — they correlate with events strongly and reproducibly — but because magnitude ranks by duration×strength of firing, so it surfaces persistent trackers over event detectors. The semantic feature a user expects to see for a brief event sits below a continuously-firing feature. Temporal-stability ranking surfaced the event/semantic features better here (4 of its top 5 were collision-correlated). The sub-question that remains open: *which* substrate-adapted ranking (stability vs causal vs an event-conditioned Δ) is best, and whether that holds beyond Breakout layer 5 — now a concrete, testable question rather than a vague worry.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.

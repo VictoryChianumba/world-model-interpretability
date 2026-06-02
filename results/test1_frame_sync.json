@@ -1,0 +1,63 @@
+{
+  "episodes": [
+    {
+      "episode": 0,
+      "steps": 150,
+      "pre_step_capture": {
+        "best_lag": 0,
+        "mean_abs_diff_by_lag": {
+          "-2": 0.00453,
+          "-1": 0.00436,
+          "0": 0.00376,
+          "1": 0.00428,
+          "2": 0.00449
+        }
+      },
+      "post_step_capture": {
+        "best_lag": 1,
+        "mean_abs_diff_by_lag": {
+          "-2": 0.00459,
+          "-1": 0.00453,
+          "0": 0.00436,
+          "1": 0.00376,
+          "2": 0.00428
+        }
+      }
+    },
+    {
+      "episode": 1,
+      "steps": 150,
+      "pre_step_capture": {
+        "best_lag": 0,
+        "mean_abs_diff_by_lag": {
+          "-2": 0.00448,
+          "-1": 0.00434,
+          "0": 0.00376,
+          "1": 0.00427,
+          "2": 0.00445
+        }
+      },
+      "post_step_capture": {
+        "best_lag": 1,
+        "mean_abs_diff_by_lag": {
+          "-2": 0.00461,
+          "-1": 0.00448,
+          "0": 0.00434,
+          "1": 0.00376,
+          "2": 0.00427
+        }
+      }
+    }
+  ],
+  "summary": {
+    "pre_step_lags": [
+      0,
+      0
+    ],
+    "post_step_lags": [
+      1,
+      1
+    ],
+    "verdict": "POST-step capture is offset by +1 (display leads activations by one frame); PRE-step capture is aligned (lag 0)."
+  }
+}

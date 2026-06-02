@@ -1,0 +1,126 @@
+{
+  "features": [
+    1199,
+    120,
+    1773,
+    1364,
+    316
+  ],
+  "roles": {
+    "1199": "collision",
+    "120": "collision",
+    "1773": "collision (stable)",
+    "1364": "air-flight tracker",
+    "316": "anti-collision (air)"
+  },
+  "episodes": [
+    {
+      "episode": 0,
+      "frames": 1200,
+      "n_events": {
+        "paddle_collision": 60,
+        "brick_destruction": 1,
+        "ball_dir_change": 13
+      },
+      "event_lift_per_feature": {
+        "1199": {
+          "paddle_collision": 5.835000038146973,
+          "brick_destruction": 0.0,
+          "ball_dir_change": 0.0
+        },
+        "120": {
+          "paddle_collision": 3.6670000553131104,
+          "brick_destruction": 0.0,
+          "ball_dir_change": 0.18799999356269836
+        },
+        "1773": {
+          "paddle_collision": 1.0049999952316284,
+          "brick_destruction": 0.0,
+          "ball_dir_change": 0.47600001096725464
+        },
+        "1364": {
+          "paddle_collision": 0.9549999833106995,
+          "brick_destruction": 0.0,
+          "ball_dir_change": 0.0
+        },
+        "316": {
+          "paddle_collision": 0.16699999570846558,
+          "brick_destruction": 0.0,
+          "ball_dir_change": 0.019999999552965164
+        }
+      },
+      "plot": "/Users/temp/Desktop/projects/world_models/wm-visualizer/results/test5_timing_ep0.png"
+    },
+    {
+      "episode": 1,
+      "frames": 1200,
+      "n_events": {
+        "paddle_collision": 59,
+        "brick_destruction": 0,
+        "ball_dir_change": 11
+      },
+      "event_lift_per_feature": {
+        "1199": {
+          "paddle_collision": 6.360000133514404,
+          "brick_destruction": null,
+          "ball_dir_change": 0.08900000154972076
+        },
+        "120": {
+          "paddle_collision": 4.539000034332275,
+          "brick_destruction": null,
+          "ball_dir_change": 0.0
+        },
+        "1773": {
+          "paddle_collision": 0.27399998903274536,
+          "brick_destruction": null,
+          "ball_dir_change": 0.0
+        },
+        "1364": {
+          "paddle_collision": 1.027999997138977,
+          "brick_destruction": null,
+          "ball_dir_change": 0.0
+        },
+        "316": {
+          "paddle_collision": 0.16599999368190765,
+          "brick_destruction": null,
+          "ball_dir_change": 0.0
+        }
+      },
+      "plot": "/Users/temp/Desktop/projects/world_models/wm-visualizer/results/test5_timing_ep1.png"
+    }
+  ],
+  "summary": {
+    "paddle_collision_lift": [
+      {
+        "feature": 1199,
+        "paddle_lift_ep0": 5.835000038146973,
+        "paddle_lift_ep1": 6.360000133514404,
+        "consistent": true
+      },
+      {
+        "feature": 120,
+        "paddle_lift_ep0": 3.6670000553131104,
+        "paddle_lift_ep1": 4.539000034332275,
+        "consistent": true
+      },
+      {
+        "feature": 1773,
+        "paddle_lift_ep0": 1.0049999952316284,
+        "paddle_lift_ep1": 0.27399998903274536,
+        "consistent": true
+      },
+      {
+        "feature": 1364,
+        "paddle_lift_ep0": 0.9549999833106995,
+        "paddle_lift_ep1": 1.027999997138977,
+        "consistent": true
+      },
+      {
+        "feature": 316,
+        "paddle_lift_ep0": 0.16699999570846558,
+        "paddle_lift_ep1": 0.16599999368190765,
+        "consistent": true
+      }
+    ]
+  }
+}

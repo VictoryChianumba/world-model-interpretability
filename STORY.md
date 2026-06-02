@@ -45,6 +45,16 @@ Working hypothesis: temporal stability (features that fire consistently across m
 
 Which ranking yields the most *interpretable* features is still open: it waits on the autointerp labels (built, not yet run) so the top of each ranking can be read side by side. Documenting the rankings — and their disagreement — is the research output.
 
+## Part VI — Diagnosing the decoupling
+
+The open question turned concrete through a complaint while using the tool: SAE features looked *decoupled* from on-screen events — firing in mid-air, flat during paddle-ball collisions. A five-test diagnostic battery was run to find out whether the features were broken, mislabeled, or just being mis-ranked. The first three tests resolved it:
+
+- A real but small **display bug**: the game frame was captured one step after the activations it was shown beside, so the frame led its own activations by one frame (fixed).
+- Extraction is **bit-exact deterministic** — no measurement noise.
+- The decisive finding: features are **not** decoupled. Clean collision detectors exist and are highly reproducible (Δ collision-vs-air ranking correlates +0.977 across episodes). But the *most-active* feature — the one the magnitude ranking puts at the top — is an air-flight ball-tracker that goes quiet at the paddle. The user was watching the top of the firing list during a collision and seeing a feature whose job is to track the ball in flight, not detect the hit. The "decoupling" was a ranking mismatch, not absent structure.
+
+So the central question is now answered, not just framed: activation magnitude *is* a poor importance signal here — not because features lack meaning, but because magnitude ranks persistent features over event features, and the event features are exactly what a human scanning for "the collision feature" expects to see. Temporal stability surfaced the collision detectors better (4 of its top 5 were collision-correlated). The substrate-adapted rankings earn their place on evidence, not just principle.
+
 ## Where this sits
 
-A working interpretability tool for IRIS-class world models, structurally correct and functionally complete for its core experiment (intervene on a feature, see imagined rollouts diverge over 20 steps). The methodological findings — about tokenizer compression, argmax decoding limits, single-frame priming, and the inadequacy of LLM-style feature importance — are the research output, more than the tool itself. The tool is the substrate that made the findings visible.
+A working interpretability tool for IRIS-class world models, structurally correct and functionally complete for its core experiment (intervene on a feature, see imagined rollouts diverge over 20 steps). The methodological findings — tokenizer compression (even the 64×64 model input loses the ball), argmax decoding limits, single-frame priming, a one-frame display/activation offset, and above all that magnitude surfaces persistent features rather than event features — are the research output, more than the tool itself. The tool is the substrate that made the findings visible; the diagnostic battery is what turned "the features feel decoupled" into "magnitude ranks the wrong features, and here is the one the user was watching."
