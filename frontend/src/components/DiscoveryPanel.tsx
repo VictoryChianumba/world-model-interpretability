@@ -14,19 +14,22 @@ interface Props {
   paused: boolean;
 }
 
+// Two discovery axes. A "causal" axis was investigated and deliberately NOT shipped here:
+// fixed-norm causal importance only reached cross-set Spearman ~0.49 (< 0.6 bar), so it is
+// not reproducible enough to rank features in the UI. It remains a characterization tool
+// (scripts/causal_importance.py + /feature). See WRITEUP Part VI "Causal importance, revisited".
 const METRICS: { key: RankingMetric; label: string; title: string }[] = [
   { key: "firing", label: "firing", title: "Top-K by current activation magnitude (LLM-SAE convention; churns frame-to-frame)" },
   { key: "stability", label: "stable", title: "Fires consistently across the recent window (low coefficient of variation)" },
-  { key: "causal", label: "causal", title: "Offline: intervention's mean token-divergence effect on rollouts" },
 ];
 
 /**
  * DiscoveryPanel — find candidate features to pin, under a switchable ranking.
  *
  * The metric toggle is the substrate-adaptation experiment made visible: "firing" is the
- * borrowed LLM convention (and visibly churns); "stable" and "causal" are the world-model
- * alternatives. Clicking a row pins it to the canvas (the real workspace). Score bars are
- * normalized within the current ranking.
+ * borrowed LLM convention (and visibly churns); "stable" is the world-model alternative that
+ * survived validation. Clicking a row pins it to the canvas. Score bars are normalized within
+ * the current ranking.
  */
 export default function DiscoveryPanel({
   metric,

@@ -23,13 +23,15 @@ from typing import Any, Dict, List, Optional
 class CausalRankingStore:
     """Paths + (de)serialization for one SAE layer's causal-importance scores."""
 
-    def __init__(self, root: str, layer: int) -> None:
+    def __init__(self, root: str, layer: int, tag: str = "") -> None:
         self.root = Path(root)
         self.layer = int(layer)
+        self.tag = tag  # e.g. "fixed_norm" → causal_fixed_norm_L{layer}.json
 
     @property
     def path(self) -> Path:
-        return self.root / f"causal_L{self.layer}.json"
+        suffix = f"_{self.tag}" if self.tag else ""
+        return self.root / f"causal{suffix}_L{self.layer}.json"
 
     def load(self) -> Dict[str, Any]:
         if self.path.exists():

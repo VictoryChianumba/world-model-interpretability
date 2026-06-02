@@ -34,6 +34,7 @@ Example
 """
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -97,46 +98,57 @@ def gen_actions(agent, wm, tokenizer, init, device, n_steps, seed):
 
 
 @torch.no_grad()
-def seed_state(agent, wm, tokenizer, sae, layer, norm_mean, norm_std, env, warmup, device):
-    """Roll the real policy `warmup` steps to a representative state; return (obs_tokens,
-    feats) where feats is the SAE feature vector at that state (for magnitude-relative refs)."""
+def sample_states(agent, wm, tokenizer, sae, layer, norm_mean, norm_std, env,
+                  n, warmup, stride, device):
+    """Capture `n` DIVERSE seed states by time-sampling one playthrough at steps
+    warmup, warmup+stride, ..., warmup+(n-1)*stride.
+
+    The env reset + the (confident) policy are effectively deterministic, so re-seeding
+    torch does NOT vary the seed state — verified empirically. Diversity therefore has to
+    come from sampling different *points* along the trajectory. Each captured state is the
+    obs_tokens + its SAE feature vector. Different `warmup` offsets give disjoint state sets
+    (used for the cross-state-set robustness check)."""
     from einops import rearrange
     captured = {}
     h = wm.transformer.blocks[layer].register_forward_hook(
-        lambda m, i, o: captured.__setitem__("resid", o.detach())
-    )
-    obs = env.reset()
-    agent.actor_critic.reset(n=1)
-    for _ in range(warmup):
+        lambda m, i, o: captured.__setitem__("resid", o.detach()))
+    obs = env.reset(); agent.actor_critic.reset(n=1)
+    capture_at = {warmup + i * stride for i in range(n)}
+    total = warmup + (n - 1) * stride
+    states = []
+    for step in range(total + 1):
         obs_t = rearrange(torch.FloatTensor(obs).div(255), "n h w c -> n c h w").to(device)
         act = agent.act(obs_t, should_sample=True).cpu().numpy()
+        if step in capture_at:
+            obs_tokens = tokenizer.encode(obs_t, should_preprocess=True).tokens
+            tokens = torch.cat([obs_tokens, torch.tensor([[int(act[0])]], device=device)], dim=1)
+            captured.clear(); wm(tokens, past_keys_values=None)
+            x = (captured["resid"][0, -1] - norm_mean) / norm_std
+            states.append((obs_tokens, sae.encode(x.unsqueeze(0)).squeeze(0)))
         obs, _r, done, _ = env.step(act)
         if (bool(done[0]) if hasattr(done, "__len__") else bool(done)):
-            obs = env.reset()
-            agent.actor_critic.reset(n=1)
-    obs_t = rearrange(torch.FloatTensor(obs).div(255), "n h w c -> n c h w").to(device)
-    act = agent.act(obs_t, should_sample=True).cpu().numpy()
-    enc = tokenizer.encode(obs_t, should_preprocess=True)
-    obs_tokens = enc.tokens  # (1, K)
-    tokens = torch.cat([obs_tokens, torch.tensor([[int(act[0])]], device=device)], dim=1)
-    captured.clear()
-    wm(tokens, past_keys_values=None)
-    x = (captured["resid"][0, -1] - norm_mean) / norm_std
-    feats = sae.encode(x.unsqueeze(0)).squeeze(0)
+            obs = env.reset(); agent.actor_critic.reset(n=1)
     h.remove()
-    return obs_tokens, feats
+    return states
+
+
+def per_step_divergence(baseline_tokens, iv_tokens):
+    """Per-step number of obs tokens that differ baseline vs intervened (length n_steps)."""
+    return [int((b != v).sum().item()) for b, v in zip(baseline_tokens, iv_tokens)]
 
 
 def mean_token_divergence(baseline_tokens, iv_tokens):
     """Mean over steps of the number of obs tokens that differ baseline vs intervened."""
-    return float(np.mean([
-        int((b != v).sum().item()) for b, v in zip(baseline_tokens, iv_tokens)
-    ]))
+    return float(np.mean(per_step_divergence(baseline_tokens, iv_tokens)))
 
 
 @torch.no_grad()
 def run(args) -> None:
     device = torch.device(args.device)
+    # Seed states come from a deterministic Atari reset + warmup, so without this every
+    # run/process samples the SAME starting state. --state-seed varies the warmup RNG so we
+    # can assess robustness to the choice of seed states (not just rollout sampling).
+    torch.manual_seed(args.state_seed)
     log(f"Loading agent {args.checkpoint} + SAE {args.sae} (device={args.device})")
     agent, env, _cfg = _load_agent(_IRIS_ROOT, args.checkpoint, args.env_id, args.device)
     agent.eval()
@@ -149,30 +161,44 @@ def run(args) -> None:
     norm_std = meta["norm"]["std"].to(device).clamp_min(1e-6)
     log(f"SAE layer={layer} d_hidden={sae.d_hidden} env={env_id}")
 
-    # Per-seed: a representative state, its feature vector (for refs), a frozen action
-    # sequence, and the baseline token rollout (computed once, reused for every feature).
+    # N DIVERSE seed states (time-sampled along one playthrough), each with a frozen action
+    # sequence and a baseline rollout (computed once, reused for every feature). Averaging
+    # over diverse states is what makes the causal score generalize beyond one game frame.
+    states = sample_states(agent, wm, tokenizer, sae, layer, norm_mean, norm_std,
+                           env, args.seeds, args.warmup, args.state_stride, device)
+    log(f"sampled {len(states)} diverse states (warmup {args.warmup}, stride {args.state_stride})")
     seeds_init, seeds_feats, seeds_actions, seeds_baseline = [], [], [], []
-    for s in range(args.seeds):
-        init, feats = seed_state(agent, wm, tokenizer, sae, layer, norm_mean, norm_std,
-                                 env, args.warmup, device)
+    for s, (init, feats) in enumerate(states):
         init = init.to(device)
         actions = gen_actions(agent, wm, tokenizer, init, device, args.n_steps, seed=s)
         baseline = _rollout(wm, tokenizer, init, actions, device, intervention=None, seed=s)
         seeds_init.append(init); seeds_feats.append(feats)
         seeds_actions.append(actions); seeds_baseline.append(baseline)
-        log(f"  seed {s}: baseline rollout ready ({len(actions)} steps)")
 
-    # Rank features by mean seed-state activation so a --features sample hits active ones.
+    # Seed-state activation per feature (the `act` field — used to *verify* that fixed-norm
+    # removed the magnitude confound, NOT to scale the injection).
     mean_ref = torch.stack([f for f in seeds_feats]).mean(0)  # (d_hidden,)
-    order = torch.argsort(mean_ref, descending=True).tolist()
-    if args.features:
-        order = order[: args.features]
 
-    store = CausalRankingStore(str(args.out_dir), layer)
+    # Which features to score. --features-file (a JSON list of ids) takes precedence; else
+    # the N most-active (legacy). Fixed-norm runs use the candidate file.
+    if args.features_file:
+        order = [int(x) for x in json.loads(Path(args.features_file).read_text())]
+        log(f"scoring {len(order)} candidate features from {args.features_file}")
+    else:
+        order = torch.argsort(mean_ref, descending=True).tolist()
+        if args.features:
+            order = order[: args.features]
+
+    tag = "fixed_norm" if args.fixed_norm else ""
+    store = CausalRankingStore(str(args.out_dir), layer, tag=tag)
     data = store.load() if args.resume else {"layer": layer, "scores": {}}
     data.update({
         "layer": layer, "env_id": env_id, "n_steps": int(args.n_steps),
         "scale": float(args.scale), "seeds": int(args.seeds), "warmup": int(args.warmup),
+        # injection mode: fixed_norm injects scale*unit_direction for every feature (causal
+        # effect independent of activation); magnitude_relative scales by the feature's own
+        # activation (the original — collapses the ranking toward magnitude).
+        "injection": "fixed_norm" if args.fixed_norm else "magnitude_relative",
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     data.setdefault("scores", {})
@@ -182,32 +208,38 @@ def run(args) -> None:
         if args.resume and str(fid) in data["scores"]:
             continue
         pos_divs, neg_divs = [], []
+        step_accum = np.zeros(args.n_steps); n_contrib = 0
+        unit = sae.W_dec[fid] * norm_std  # raw-space feature direction (W_dec is unit-norm)
         for s in range(args.seeds):
-            ref = max(float(seeds_feats[s][fid]), MAG_FLOOR)
-            unit = sae.W_dec[fid] * norm_std  # raw-space feature direction
+            # fixed-norm: ref=1.0 for ALL features → injection = scale * unit_direction,
+            # identical magnitude regardless of activation. (This equals what the original
+            # run already did for its act==0 features.)
+            ref = 1.0 if args.fixed_norm else max(float(seeds_feats[s][fid]), MAG_FLOOR)
             for scale, bucket in ((args.scale, pos_divs), (-args.scale, neg_divs)):
                 direction = (scale * ref * unit).detach()
                 iv = _rollout(wm, tokenizer, seeds_init[s], seeds_actions[s], device,
                               intervention=(layer, direction), seed=s)
-                bucket.append(mean_token_divergence(seeds_baseline[s], iv))
+                steps = per_step_divergence(seeds_baseline[s], iv)
+                bucket.append(float(np.mean(steps)))
+                step_accum += np.array(steps, dtype=float); n_contrib += 1
         pos = float(np.mean(pos_divs)); neg = float(np.mean(neg_divs))
         data["scores"][str(fid)] = {
             "id": int(fid),
             "score": round((pos + neg) / 2.0, 4),  # mean |token divergence| over signs+seeds
             "pos": round(pos, 4),
             "neg": round(neg, 4),
-            # Mean seed-state activation magnitude — lets the ranking be compared directly
-            # against the top-K-by-magnitude convention (do causal and magnitude agree?).
             "act": round(float(mean_ref[fid]), 4),
+            # Per-step mean divergence (over seeds*signs) — for qualitative characterization.
+            "trace": [round(x, 3) for x in (step_accum / max(n_contrib, 1)).tolist()],
         }
         processed += 1
         if processed % args.save_every == 0:
             store.save(data)
-            log(f"  scored {processed} features (last #{fid}: {data['scores'][str(fid)]['score']})")
+            log(f"  scored {processed}/{len(order)} (last #{fid}: {data['scores'][str(fid)]['score']})")
 
     store.save(data)
-    log(f"Done: scored {processed} features (seeds={args.seeds}, scale=±{args.scale}, "
-        f"n_steps={args.n_steps}) → {store.path}")
+    log(f"Done: scored {processed} features ({data['injection']}, seeds={args.seeds}, "
+        f"scale=±{args.scale}, n_steps={args.n_steps}) → {store.path}")
     try:
         env.close()
     except Exception:
@@ -221,10 +253,18 @@ def parse_args():
     p.add_argument("--sae", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, default=None, help="Cache root (default: SAE dir)")
     p.add_argument("--features", type=int, default=0, help="Score only the N most-active features (0=all)")
-    p.add_argument("--seeds", type=int, default=2, help="Seed states averaged (>=2 for discipline)")
+    p.add_argument("--features-file", type=str, default=None,
+                   help="JSON list of feature ids to score (candidate set; overrides --features)")
+    p.add_argument("--fixed-norm", action="store_true",
+                   help="Magnitude-INDEPENDENT injection: scale*unit_direction for every feature "
+                        "(ref=1.0), so causal score doesn't covary with activation. Writes "
+                        "causal_fixed_norm_L{layer}.json.")
+    p.add_argument("--seeds", type=int, default=2, help="Number of DIVERSE seed states (time-sampled) averaged")
+    p.add_argument("--state-stride", type=int, default=30, help="Steps between sampled seed states along the playthrough")
     p.add_argument("--n-steps", type=int, default=20, help="Imagined rollout length")
     p.add_argument("--scale", type=float, default=5.0, help="Magnitude-relative intervention scale (±)")
     p.add_argument("--warmup", type=int, default=30, help="Real-env steps to a representative seed state")
+    p.add_argument("--state-seed", type=int, default=0, help="RNG seed for the warmup → varies WHICH seed states are sampled (robustness check)")
     p.add_argument("--resume", action="store_true", help="Skip features already scored in the cache")
     p.add_argument("--save-every", type=int, default=10, help="Save the cache every N scored features")
     p.add_argument("--device", type=str, default="cpu")

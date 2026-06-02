@@ -136,6 +136,13 @@ This is the first concrete instance of the project's thesis: importing the LLM c
 
 ### Implementation — causal importance (done; partial sample measured)
 
+> **⚠️ Superseded — read "Causal importance, revisited" below.** This section's ranking was
+> later found to be a **magnitude confound**: the magnitude-relative injection scaled the
+> perturbation by each feature's own activation, so "most causal" was largely "most active"
+> re-expressed. The fix (fixed-norm injection) plus a deeper seed-state-diversity problem led
+> to the decision **not** to ship causal as a discovery axis. The numbers below stand as what
+> was measured, but the interpretation does not.
+
 Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer}.json` → `GET /ranking/causal`, surfaced as the discovery panel's third toggle. For each feature it runs ±scale intervention rollouts against a shared baseline (same seed, same frozen action sequence) and scores by **mean token divergence** — token-only, no pixel decode, so it is far cheaper than the live `/rollout`. Injection is magnitude-relative (scale × the feature's own seed-state activation), matching the live intervention semantics. Built to sample and resume; `pos`/`neg` per-sign means are kept so an asymmetric feature is visible rather than averaged away.
 
 **Sample run — two independent runs, 24 most-active features, 2 seed states, 10 steps, ±5, MPS, ~9 min each:**
@@ -147,6 +154,28 @@ Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer
 **Caveat (scope, stated honestly):** this sample scores only the high-firing head (top-24 by activation), so the magnitude-vs-causal correlation is measured *within* active features and is biased **upward** — across all ~2K features, including the low-firing majority where the two diverge most, agreement would be lower. The sample is enough to show the pipeline works and that magnitude is an imperfect proxy even among active features; it is not the full-feature result. The full run (all features, more seeds) is the next step. Per single-measurement discipline, every number here is from a 2-run / 2-seed sample and should be read as provisional beyond the top handful.
 
 **Which ranking is "more interpretable"?** Not yet answerable on this evidence — it needs the autointerp labels (also built, not yet run) so a human can read the top features of each ranking side by side. What the sample *does* show: the three rankings genuinely disagree (firing is unstable frame-to-frame and run-to-run; causal only moderately tracks magnitude), so they are not redundant views — picking the ranking is a real choice, which is why all three are exposed.
+
+### Causal importance, revisited — a confound, a deeper limitation, and the decision not to ship it
+
+Integrating the causal toggle triggered a verification pass that unwound the whole result. Three things, in order of discovery:
+
+**1. The magnitude confound.** A population-level cross-check showed the top of "causal importance" was the magnitude ranking re-expressed. The injection was `scale × activation × direction` (magnitude-relative — correct for the *live intervention tool*, where you steer a feature relative to itself, but wrong for an *importance ranking*). So an active feature got a bigger perturbation purely for being active. `corr(causal_score, activation) = +0.37`; among active features the score was nearly proportional to activation (#1364, activation 5.9, was injected at ~30 vs ~5 for everything else → causal "rank 1" was an artifact). **Lesson: causal-importance pipelines must use magnitude-*independent* injection, or they collapse to magnitude.** (FINDINGS.)
+
+**2. The fix exposed a deeper problem: single-state measurement.** Switching to **fixed-norm injection** (`scale × unit_direction`, same magnitude for every feature) removed the confound (`corr → −0.10`). But the scores collapsed to a narrow noise-like band, and a reproducibility check came back *bit-identical* across re-runs. The cause: the Atari env reset + the (confident, near-argmax) policy are **effectively deterministic**, so every run — and even re-seeding torch — scores against the *same seed state*. The causal score reflected essentially **one game state**. Re-seeding can't fix this; diversity has to come from sampling different *points* along a playthrough (`sample_states`, time-sampled).
+
+**3. With genuine state diversity, the signal is real but not robust enough to rank.** Averaging over diverse states widened the band and surfaced real structure — a true collision detector (#120) rose to the top, and #1364 (the air-flight tracker) is causal rank 1 *consistently* with the confound gone, confirming it drives the imagined dynamics without being a visible on-screen event (a genuine prediction/model-internal feature). But the decisive test — **cross-set robustness** (two *disjoint* sets of seed states) — only improves slowly with more states:
+
+| seed states | cross-set Spearman | top-10 overlap |
+|------------:|-------------------:|---------------:|
+| 1 (single)  | ~0.0               | —              |
+| 5           | +0.33              | 3/10           |
+| 18          | **+0.49**          | 3/10           |
+
+Diminishing returns: 3.6× the states (5→18) bought only +0.16, and the pipeline is **CPU-dispatch-bound** (each rollout is ~17 tiny autoregressive WM passes in a Python loop; 18 states × 80 features ≈ 490k serial calls per run, and a bigger GPU barely helps — see FINDINGS). Reaching a trustworthy bar (Spearman ≳ 0.6) would take many tens of states at impractical cost.
+
+**Decision (pre-committed rule: integrate iff cross-set Spearman ≥ 0.6).** **+0.49 < 0.6 → do not ship causal as a discovery-panel ranking.** The discovery panel keeps **two** axes — firing (magnitude) and temporal stability. Causal importance stays as a *characterization* tool (the script + `/feature` endpoint): it reliably flags the top handful of causally-potent features (#1364, #120, #1773) for per-feature analysis, but it is not reproducible enough to rank all ~2K features as a primary discovery surface. The magnitude-relative full run is *not* trustworthy and was removed; the fixed-norm verdict data is kept under `data/` as a research artifact.
+
+**Net of the whole arc:** of the three proposed importance axes, **two survived** (magnitude, stability) and one (causal) was demoted to characterization after the confound and the single-state limitation were found and measured. That is the honest answer — and finding *why* causal didn't make it (magnitude coupling, deterministic seed states, dispatch-bound cost) is the more transferable result than a fourth ranking would have been.
 
 ### Feature characterization test battery
 

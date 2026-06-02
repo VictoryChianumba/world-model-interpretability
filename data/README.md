@@ -1,40 +1,40 @@
-# Precomputed caches
+# Causal-importance research artifacts
 
-Generated artifacts checked in so a fresh clone / demo has data without re-running the
-hours-long offline pipelines. **These are derived data, not source** — they are tied to a
-specific SAE checkpoint and go stale if that checkpoint is retrained.
+These are **research artifacts, not a shipped feature**. Causal importance was investigated
+as a third discovery-panel ranking and **deliberately not integrated** — fixed-norm causal
+importance reached only cross-set Spearman ≈ 0.49 (below the pre-committed 0.6 bar), so it is
+not reproducible enough to rank features in the UI. See `WRITEUP.md` Part VI, "Causal
+importance, revisited," for the full story (magnitude confound → single-state limitation →
+robustness plateau → decision). The pipeline survives as a *characterization* tool
+(`backend/scripts/causal_importance.py` + the `/feature/{id}` endpoint).
 
-## `causal_L5.json` — causal-importance ranking snapshot
+> The earlier `causal_L5.json` (a 2048-feature **magnitude-relative** run) was removed: it was
+> confounded — its scores covaried with activation, so it was a magnitude ranking in disguise.
 
-Per-feature causal importance (mean token divergence under ±scale intervention rollouts),
-read by `GET /ranking/causal` and the discovery panel's **causal** toggle.
+## `causal_fixed_norm_18state_{A,B}.json`
+
+The two disjoint-state-set runs behind the final verdict. Magnitude-**independent** (fixed-norm)
+injection, 18 time-sampled diverse states each, A = warmup 30 / B = warmup 45.
 
 | field | value |
 |---|---|
-| SAE checkpoint | `sae_L5.pt` (sha256 `ee5ee63ad564d85d…`) |
-| layer | 5 |
-| env | `BreakoutNoFrameskip-v4` |
-| params | `--seeds 2 --n-steps 10 --scale 5` |
-| features scored | **2048 (full run)** |
-| compute | RunPod A100-80GB, ~3h (CUDA) |
-| generated | 2026-06-02 |
+| SAE | `sae_L5.pt` (sha256 `ee5ee63ad564d85d…`), layer 5, Breakout |
+| injection | `fixed_norm` (`scale × unit_direction`; activation-independent) |
+| params | `--seeds 18 --state-stride 30 --n-steps 10 --scale 5` |
+| features | 80 candidates (∪ of top-50 magnitude / stability / collision-Δ + 6 case-study) |
+| per feature | `score`, `pos`/`neg` (per-sign mean token divergence), `act`, `trace` (per-step) |
+| compute | RunPod A100, CUDA |
 
-**Full coverage.** All 2048 features, scored against one consistent set of seed-states in a
-single GPU run (top by score: #1364 15.0, #286 11.0, #497 10.4 — the air-flight tracker
-#1364 remains #1, matching the earlier CPU sample). Regenerate with:
-
-```bash
-python backend/scripts/causal_importance.py \
-  --checkpoint <iris>/checkpoints/Breakout.pt --sae <iris>/checkpoints/sae_L5.pt \
-  --seeds 2 --n-steps 10 --scale 5 --device mps --resume
-```
-
-**To use this snapshot**, copy it next to the SAE artifact (the backend reads from
-`SAE_DIR`, default = the checkpoint dir):
+**Verdict:** A vs B Spearman **+0.49**, top-10 overlap 3/10. Confound gone
+(`corr(score, act) ≈ +0.2`). The top handful is reproducible (#1364 air-tracker rank 1,
+#120 collision rank 2), the tail is not. Regenerate / extend with more states:
 
 ```bash
-cp data/causal_L5.json <iris>/checkpoints/causal_L5.json
+python backend/scripts/causal_importance.py --checkpoint <iris>/checkpoints/Breakout.pt \
+  --sae <iris>/checkpoints/sae_L5.pt --fixed-norm \
+  --features-file results/causal_candidate_ids.json \
+  --seeds 18 --state-stride 30 --n-steps 10 --scale 5 --warmup 30 --device cuda
 ```
 
-If the SAE is retrained (hash changes), delete and regenerate — the scores won't correspond
-to the new dictionary.
+Note: the scorer is CPU-dispatch-bound (autoregressive rollouts in a Python loop), so a GPU
+barely helps — batching the rollouts is the real speedup. See FINDINGS.
