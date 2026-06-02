@@ -15,12 +15,13 @@ read by `GET /ranking/causal` and the discovery panel's **causal** toggle.
 | layer | 5 |
 | env | `BreakoutNoFrameskip-v4` |
 | params | `--seeds 2 --n-steps 10 --scale 5` |
-| features scored | 644 (most-active-first; partial run, stopped early) |
-| generated | 2026-06-01 |
+| features scored | **2048 (full run)** |
+| compute | RunPod A100-80GB, ~3h (CUDA) |
+| generated | 2026-06-02 |
 
-**Partial by design.** The pipeline scores features in descending activation order and was
-stopped at 644/2048 — the silent majority of the remaining features have ≈0 activation and
-≈0 causal effect, so the meaningful features are covered. Regenerate / extend with:
+**Full coverage.** All 2048 features, scored against one consistent set of seed-states in a
+single GPU run (top by score: #1364 15.0, #286 11.0, #497 10.4 — the air-flight tracker
+#1364 remains #1, matching the earlier CPU sample). Regenerate with:
 
 ```bash
 python backend/scripts/causal_importance.py \
