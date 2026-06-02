@@ -18,7 +18,7 @@ Migrated to a FastAPI + React web stack so the rendering layer could support the
 
 ## Part II — Training an SAE and discovering what didn't work
 
-Trained TopK SAEs on layer 5 residual stream activations from ~5K Breakout frames. Got an interpretable SAE (L0 ≈ 15, sharp magnitude falloff), but discovered that the live-feature-list UX borrowed from LLM tools didn't work — features kept switching as the rollout advanced, no persistent identity, no way to track or compare features across frames.
+Trained a ReLU/L1 SAE on layer 5 residual stream activations from ~5K Breakout frames. Got an interpretable SAE (L0 ≈ 15, sharp magnitude falloff), but discovered that the live-feature-list UX borrowed from LLM tools didn't work — features kept switching as the rollout advanced, no persistent identity, no way to track or compare features across frames.
 
 ## Part III — The intervention design that didn't measure what it claimed
 

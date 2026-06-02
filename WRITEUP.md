@@ -24,7 +24,14 @@ Reasons for the migration: web stack would give better visual options (multiple 
 
 ## Part III — SAE training pipeline
 
-Trained TopK SAEs on layer 5/6/7 residual stream activations from Breakout rollouts. ~80k vectors total (22 episodes / 4,717 frames × 17 token positions per frame). 100 epochs, L1=2.0.
+Trained ReLU/L1 SAEs on layer 5/6/7 residual stream activations from Breakout rollouts. ~80k vectors total (22 episodes / 4,717 frames × 17 token positions per frame). 100 epochs, L1=2.0.
+
+> **Correction (terminology).** This section originally said "TopK SAEs." That is wrong: the
+> trained SAE (`backend/sae.py`) is a plain **ReLU autoencoder with an L1 penalty**
+> (`f = relu((x − b_dec) @ W_enc + b_enc)`, loss `recon + l1_coeff·‖f‖₁`, `l1_coeff = 2.0`),
+> not a TopK SAE — there is no top-k masking anywhere in the code. The L0 ≈ 14–15 sparsity is
+> achieved by the L1 penalty, not a hard k. The dimensions are `d_in = 256`, `d_hidden = 2048`
+> (8× expansion). Corrected during the blog-post drafting pass; same correction applied in STORY.md.
 
 **Results:** L0 ≈ 14-15 at all three layers (interpretable band is 10-50, vs. the placeholder's ~960), reconstruction MSE around 20. Top-feature magnitudes fall off sharply (3.5 → 2.7 → 2.1 → 1.2 → 0.5) instead of the placeholder's flat 2.2-2.7. SAE is real and behaving like a normal SAE.
 
