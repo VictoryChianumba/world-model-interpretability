@@ -179,6 +179,33 @@ A diagnostic batch run to resolve an observation made while using the tool: SAE 
 
 **Done:** diff statistics (all zero) recorded; eval-mode confirmed; extraction noise ruled out.
 
+#### Test 3 — paddle-ball collision correlation
+
+**Question.** Do features fire more strongly during paddle-ball collisions than during ball-in-air states?
+
+**Method.** `scripts/diagnostics/test3_collision_correlation.py`. Each frame: compute the full 2048-feature vector AND label the frame collision/air/neither. *Labeling note (itself a finding):* the 64×64 model obs cannot resolve the Breakout ball — it is sub-pixel after the resize, so `state_extract` finds nothing (0 balls in 400 frames). Labeling instead uses the full-resolution 210×160 human frame, which depicts the same moment. Ball and paddle are both red (200,72,72); below the brick band (rows 93–184) the only red object is the ball; the paddle is red at rows 185–194. *Collision* = ball there with |ball_x − paddle_x| ≤ 12 px; *air* = ball_y ≤ 150 px. For the top-50 features by overall activity: μ_c (mean activation over collision frames), μ_a (over air frames), Δ = μ_c − μ_a, within-group std. 20 collision + 20 air frames per episode, 2 independent episodes.
+
+**Result.** The Δ ranking is **strongly structured and highly reproducible** — Δ Spearman **+0.977** across the two episodes (47 shared top-50 features), top-10-by-Δ overlap 7/10. Of the top-50 most-active features (episode 0): **15 collision-correlated** (Δ > 0.1), **22 flat** (|Δ| ≤ 0.1), **13 anti-correlated** (Δ < −0.1).
+
+| feature | μ_c | μ_a | Δ | note |
+|--------:|----:|----:|----:|------|
+| #1199 | 1.40 | 0.00 | **+1.40** | fires *only* at collision (std_a = 0) |
+| #120  | 1.23 | 0.05 | +1.19 | collision detector |
+| #1773 | 1.13 | 0.00 | +1.13 | collision detector (also #1 temporal-stability) |
+| #27   | 1.04 | 0.04 | +1.01 | collision detector |
+| #1167 | 0.96 | 0.03 | +0.92 | collision detector |
+| …     |      |      |      | (22 features flat, Δ ≈ 0) |
+| #316  | 0.03 | 0.58 | −0.55 | fires in air |
+| #1364 | 0.82 | 5.57 | **−4.75** | strong **air-flight / ball-tracking** feature |
+
+**Interpretation — this resolves the user's observation, with two distinct causes.** Features are *not* uniformly decoupled from events: clean collision detectors exist (#1199, #120, #1773 fire essentially only at collision), are well-separated (Δ up to +1.4), and are robust across episodes (+0.977). But the feature at the *top of the magnitude ("firing") ranking the discovery panel shows by default* — **#1364, the single most-active feature and the top causal feature from Part VI** — is the most strongly *anti*-collision feature in the battery: μ_a = 5.57 vs μ_c = 0.82. It tracks the ball in mid-flight and goes quiet at the paddle. So a user watching the top-firing feature during a collision sees it stay flat — exactly the reported "feature doesn't fire during the collision." That is not a bug and not perception bias: it is a real ranking mismatch. The collision detectors are real but rank *below* the persistent ball-tracker by magnitude, because a feature that fires throughout flight accumulates more activity than one that fires for the few frames of contact.
+
+Combined with Test 1 (a one-frame display offset, fixed) and Test 2 (extraction is exact), the decoupling is explained: a small genuine display bug, plus the larger fact that **activation magnitude surfaces persistent features (ball-trackers), not event features (collision detectors)** — so the panel's default ranking shows the user a feature whose semantics (mid-air ball tracking) don't match the event they were looking at.
+
+**Cross-link to the rankings (Part VI).** 4 of the 5 most temporally-*stable* features (#27, #1221, #1773, #1789) are in the collision-correlated top-10 — early evidence that temporal stability surfaces semantically-tied features better than magnitude does, while magnitude's #1 (#1364) is semantically an air-tracker. This is consistent with the project's thesis that magnitude is a poor importance signal on this substrate; it is *suggestive*, not settled (one game, one feature-set, the stability↔collision overlap is a single comparison — but the Δ ranking it builds on is reproducible at +0.977).
+
+**Done:** Δ table committed (`results/test3_collision_correlation.json`); collision-correlated / flat / anti-correlated counts and the magnitude-vs-semantics mismatch written up; ranking stable across 2 episodes.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.

@@ -44,6 +44,18 @@ This is invisible to static inspection and easy to introduce, and it manifests a
 
 **Implication:** when activations and a rendered frame are presented together as "the same moment," measure the frame↔activation lag explicitly — don't assume zero, and don't let one-message bundling stand in for same-step alignment. A one-frame offset is small but it is precisely the artifact a human reads as "the feature is decoupled from the event."
 
+### Activation magnitude surfaces *persistent* features, not *event* features — which reads as "features are decoupled from events"
+
+In a world-model SAE, ranking features by activation magnitude (the LLM-SAE default) is dominated by features that fire *continuously* — e.g. a feature tracking the ball through its entire mid-air flight — over features that fire *briefly at salient events* — e.g. a feature that fires only during a paddle-ball collision. The event feature accumulates less total activity (a few frames of contact vs. dozens of frames of flight), so it ranks lower. Measured on Breakout layer 5 (Test 3): of the top-50 features by activity, ~15 were collision-correlated, ~22 flat, ~13 anti-correlated; and the single most-active feature was the *most strongly anti-collision* feature in the set (mean activation 5.57 in mid-air vs 0.82 at collision) — a ball-tracker, not a collision detector. The collision detectors existed and were robust (Δ = μ_collision − μ_air reproducible across episodes at Spearman +0.977) but sat below the persistent ball-tracker by magnitude.
+
+This is the mechanism behind a common complaint that "the SAE features don't correspond to the on-screen events." They can and do — but if the UI ranks by magnitude and the user expects the top feature to fire at a specific brief event, the top feature is instead whatever fires most *persistently*, whose semantics (continuous tracking) won't match a brief event. The feature looking "flat during the collision" is correct behavior for a mid-flight tracker.
+
+**Implication:** for discovering *event-detector* features, magnitude is the wrong sort key — it ranks by duration×strength of firing, not by tie-to-an-event. Event-conditioned contrast (mean activation at event vs not, i.e. a Δ score) or temporal-stability ranking surfaces event/semantic features better. And before concluding "features are decoupled from events," check whether the *ranking* is showing you event features at all.
+
+### Even the model's input resolution can be too coarse to label the object of interest
+
+The Breakout ball is recoverable from the 210×160 human frame but **not** from the 64×64 obs the model actually consumes — at 64×64 the ball is sub-pixel and a brightness-blob extractor finds nothing across hundreds of frames. This extends the tokenizer-compression finding upward: it is not only the 16-token *reconstruction* that loses small objects, it is the model's 64×64 *input* itself. Any pixel-space event labeling for behavioral interpretability must therefore label from the original full-resolution frame, not the model obs (they depict the same moment, so the labels still align with the activations). Assuming the model input is fine-grained enough to label from is a trap.
+
 ### Causal importance only moderately tracks activation magnitude — and a single causal run is noisy
 
 Two independent partial runs of causal-importance scoring (mean token divergence under ±5 intervention rollouts; 24 most-active features; 2 seed states each) on Breakout layer 5:
