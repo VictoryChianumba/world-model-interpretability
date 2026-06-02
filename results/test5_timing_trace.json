@@ -49,7 +49,7 @@
           "ball_dir_change": 0.019999999552965164
         }
       },
-      "plot": "/Users/temp/Desktop/projects/world_models/wm-visualizer/results/test5_timing_ep0.png"
+      "plot": "/Users/temp/Desktop/projects/world_models/world-model-interpretability/results/test5_timing_ep0.png"
     },
     {
       "episode": 1,
@@ -86,7 +86,7 @@
           "ball_dir_change": 0.0
         }
       },
-      "plot": "/Users/temp/Desktop/projects/world_models/wm-visualizer/results/test5_timing_ep1.png"
+      "plot": "/Users/temp/Desktop/projects/world_models/world-model-interpretability/results/test5_timing_ep1.png"
     }
   ],
   "summary": {

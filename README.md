@@ -49,7 +49,7 @@ With no KV cache (the strategy used here): `T_q = T_k = tokens_per_block = 17`, 
 ## Project structure
 
 ```
-wm-visualizer/
+world-model-interpretability/
 ├── backend/
 │   ├── hooks.py          # IrisHookExtractor — forward hook registration / teardown
 │   ├── inference.py      # InferenceEngine — background thread, bounded queue, frame encoding
@@ -150,7 +150,7 @@ wm-visualizer/
 ### 1. Backend
 
 ```bash
-cd wm-visualizer/backend
+cd world-model-interpretability/backend
 
 # Option A: reuse iris/.venv310 (all deps already installed)
 /path/to/iris/.venv310/bin/pip install fastapi uvicorn[standard] websockets
@@ -171,7 +171,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ### 2. Frontend
 
 ```bash
-cd wm-visualizer/frontend
+cd world-model-interpretability/frontend
 npm install
 npm run dev        # → http://localhost:3000
 ```
@@ -183,7 +183,7 @@ Open `http://localhost:3000`.  REST calls are proxied to `http://localhost:8000`
 **Backend:**
 
 ```bash
-cd wm-visualizer
+cd world-model-interpretability
 IRIS_ROOT=/path/to/iris \
   /path/to/iris/.venv310/bin/pytest tests/test_backend.py -v
 ```
@@ -191,7 +191,7 @@ IRIS_ROOT=/path/to/iris \
 **Frontend:**
 
 ```bash
-cd wm-visualizer/frontend
+cd world-model-interpretability/frontend
 npm test
 ```
 
@@ -201,11 +201,11 @@ npm test
 
 ```bash
 # Terminal 1 — backend
-cd wm-visualizer/backend
+cd world-model-interpretability/backend
 IRIS_ROOT=../../iris uvicorn main:app --port 8000
 
 # Terminal 2 — frontend
-cd wm-visualizer/frontend
+cd world-model-interpretability/frontend
 npm run dev
 ```
 
@@ -214,7 +214,7 @@ npm run dev
 ## Docker deployment
 
 ```bash
-# from wm-visualizer/
+# from world-model-interpretability/
 docker-compose up --build
 ```
 
@@ -294,7 +294,7 @@ curl -X POST http://localhost:8000/control \
 The backend logs to stdout.  To persist:
 
 ```bash
-uvicorn main:app --port 8000 2>&1 | tee wm-visualizer.log
+uvicorn main:app --port 8000 2>&1 | tee world-model-interpretability.log
 ```
 
 Format: `YYYY-MM-DD HH:MM:SS [LEVEL] module: message`

@@ -11,7 +11,7 @@
     "air_y": 150,
     "x_overlap": 12,
     "device": "cpu",
-    "out": "/Users/temp/Desktop/projects/world_models/wm-visualizer/results/test3_collision_correlation.json"
+    "out": "/Users/temp/Desktop/projects/world_models/world-model-interpretability/results/test3_collision_correlation.json"
   },
   "episodes": [
     {

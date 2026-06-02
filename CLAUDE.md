@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Backend
 
 ```bash
-# Start backend (from wm-visualizer/backend/)
+# Start backend (from world-model-interpretability/backend/)
 export IRIS_ROOT=/Users/temp/Desktop/projects/world_models/iris
 export IRIS_SRC=$IRIS_ROOT/src
 export CHECKPOINT_DIR=$IRIS_ROOT/checkpoints
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-# Run backend tests (from wm-visualizer/)
+# Run backend tests (from world-model-interpretability/)
 IRIS_ROOT=/Users/temp/Desktop/projects/world_models/iris \
   /Users/temp/Desktop/projects/world_models/iris/.venv310/bin/pytest tests/test_backend.py -v
 
@@ -29,7 +29,7 @@ v1 panel-grid UI is preserved at `frontend-v1/` as a runnable fallback — both 
 same backend; run the dev server from whichever directory you want.
 
 ```bash
-# From wm-visualizer/frontend/   (or frontend-v1/ for the legacy UI)
+# From world-model-interpretability/frontend/   (or frontend-v1/ for the legacy UI)
 npm run dev       # dev server → http://localhost:3000
 npm test          # Jest test suite (watch mode)
 npm test -- --watchAll=false   # single run, no watch
@@ -39,7 +39,7 @@ npm run build     # production build (also type-checks)
 ### Docker
 
 ```bash
-# From wm-visualizer/
+# From world-model-interpretability/
 docker-compose up --build
 ```
 
