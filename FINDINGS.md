@@ -36,6 +36,14 @@ Two fixes, both needed: (1) gate candidates on a firing-rate floor (a feature mu
 
 **Implication:** any "consistency" or "stability" importance metric on a sparse-feature substrate needs an activity gate, because the silent majority of features are inactive and inactivity reads as perfect stability. State the gate explicitly; it changes which features the ranking is even considering.
 
+### A step-and-render loop can ship a frame one step out of sync with its own activations
+
+In an interactive world-model viewer the natural loop is: act on obs → step the env → read activations → render. If the displayed frame is captured from the environment *after* the step (e.g. via the env's current rendered observation) while the activations were computed from the *pre-step* obs, the frame shown to the user leads its activations by one step. Measured here as a clean **+1 lag** — the argmin, over candidate shifts, of mean-abs-difference between the displayed frame and the activation obs (both downsampled to 64×64 gray) — reproducible across two episodes. Bundling frame and activations into one message guarantees they *travel and render together* but does NOT guarantee they describe the *same step*; the offset lived inside the single message.
+
+This is invisible to static inspection and easy to introduce, and it manifests as apparent feature–event decoupling: features look like they fire "just before" the on-screen event. The fix is to capture the display frame from the same timestep the activations describe (before stepping the env).
+
+**Implication:** when activations and a rendered frame are presented together as "the same moment," measure the frame↔activation lag explicitly — don't assume zero, and don't let one-message bundling stand in for same-step alignment. A one-frame offset is small but it is precisely the artifact a human reads as "the feature is decoupled from the event."
+
 ### Causal importance only moderately tracks activation magnitude — and a single causal run is noisy
 
 Two independent partial runs of causal-importance scoring (mean token divergence under ±5 intervention rollouts; 24 most-active features; 2 seed states each) on Breakout layer 5:

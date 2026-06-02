@@ -112,6 +112,8 @@ class FrameData:
     """One complete inference step, ready for JSON serialisation."""
 
     type: str = "frame"
+    frame_index: int = 0                          # monotonic step id; frame + activations
+                                                  # in this message describe the SAME step
     frame: str = ""                              # base64 PNG
     attention: Dict[str, List] = field(default_factory=dict)
     # str(layer_idx) → list[nh][T_q][T_k]
@@ -131,6 +133,7 @@ class FrameData:
     def to_dict(self) -> dict:
         return {
             "type": self.type,
+            "frame_index": self.frame_index,
             "frame": self.frame,
             "attention": self.attention,
             "norms": self.norms,
@@ -1162,6 +1165,17 @@ class InferenceEngine:
             with torch.no_grad():
                 act = agent.act(obs_tensor, should_sample=True).cpu().numpy()  # (1,)
 
+            # --- Capture the DISPLAY frame BEFORE stepping the env (Test 1 fix) ---
+            # Everything below (attention, norms, SAE features) is computed from THIS
+            # obs (obs_tensor). _get_raw_frame reads the env's current original_obs,
+            # which env.step() advances to the *next* frame — so capturing it after the
+            # step (as the code used to) shipped a frame one step AHEAD of its own
+            # activations. That one-frame semantic offset is exactly what reads as
+            # "features don't fire during the on-screen collision". Capture here so the
+            # frame and its activations describe the same timestep.
+            raw = _get_raw_frame(env)
+            frame_b64 = _encode_frame(raw)
+
             next_obs, reward, done, _ = env.step(act)
             r = float(reward[0]) if hasattr(reward, "__len__") else float(reward)
             ep_return += r
@@ -1186,9 +1200,9 @@ class InferenceEngine:
                 logger.debug("WM forward failed: %s", exc)
             hook_ms = (time.perf_counter() - t_wm) * 1000.0
 
-            # --- Encode raw frame (fetch before reconstruction so we know target size) ---
-            raw = _get_raw_frame(env)
-            frame_b64 = _encode_frame(raw)
+            # (raw / frame_b64 were captured above, before env.step, so the displayed
+            # frame and the activations below describe the same step. raw.shape is still
+            # the target size for the reconstruction/imagination decode.)
 
             # --- Decode reconstruction (only when latent clients are connected) ---
             reconstruction_b64: Optional[str] = None
@@ -1274,6 +1288,7 @@ class InferenceEngine:
             ]
 
             frame_data = FrameData(
+                frame_index=self._step_count,
                 frame=frame_b64,
                 attention=attention_payload,
                 norms=norms_payload,

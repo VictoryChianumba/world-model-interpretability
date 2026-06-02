@@ -148,6 +148,25 @@ Built as an offline pipeline: `scripts/causal_importance.py` → `causal_L{layer
 
 **Which ranking is "more interpretable"?** Not yet answerable on this evidence — it needs the autointerp labels (also built, not yet run) so a human can read the top features of each ranking side by side. What the sample *does* show: the three rankings genuinely disagree (firing is unstable frame-to-frame and run-to-run; causal only moderately tracks magnitude), so they are not redundant views — picking the ranking is a real choice, which is why all three are exposed.
 
+### Feature characterization test battery
+
+A diagnostic batch run to resolve an observation made while using the tool: SAE features appearing *decoupled* from on-screen events (firing while the ball is mid-air, flat during paddle-ball collisions). Five tests distinguish the candidate causes — (a) display-pipeline timing, (b) extraction noise, (c) wrong feature labels, (d) features that are semantically real but track something other than the expected event, (e) genuinely broken/polysemantic features. The tests are diagnostic; they do not change the running tool. Single-measurement discipline applies: results that depend on sampling specific frames or rolling out across an episode require ≥2 independent runs.
+
+#### Test 1 — frame/activation synchronization
+
+**Question.** Are the displayed game frame and the SAE activations shown beside it from the same model forward pass?
+
+**Method.** (1) Added a monotonic `frame_index` to every emitted message plus `console.debug` render logging in the frontend. (2) `scripts/diagnostics/test1_frame_sync.py` replicates the engine's per-step sequence and measures the lag between the displayed frame and the obs the activations are computed from: downsample both to 64×64 grayscale and, over candidate lags L ∈ [−2, +2], find the L minimizing mean |display[t] − obs[t+L]|. Run on 2 independent episodes. (3) A 600-frame WebSocket capture checked message-level co-delivery and `frame_index` monotonicity.
+
+**Result — two findings, opposite in sign:**
+
+- *No multi-message drift.* The game frame and activations are not separate messages — they are bundled in one `FrameData` and rendered from one React state update. Over 600 streamed frames every message carried both, with `frame_index` strictly increasing 1→600. The display-pipeline-timing hypothesis (a) is ruled out as a *multi-message / render-batch* problem.
+- *A real one-frame content offset, now fixed.* Within that single message the frame was captured **after** `env.step()` while the activations describe the **pre-step** obs — so the displayed frame led its own activations by exactly one step. The lag diagnostic measured best-lag **+1** for the old post-step capture and **0** for the pre-step capture, identically in both episodes (minimum mean-abs-diff 0.00376 at the aligned lag vs 0.00428 one step off — the whole lag table shifted by one). Fixed by capturing the display frame before `env.step()`; `frame_index` now labels the shared step.
+
+**Interpretation.** This offset is exactly the kind of artifact that reads as "features don't fire during the on-screen collision": when the displayed frame shows the collision, the activations beside it are from the frame just *before* it. It is a genuine bug (not perception bias) and a *partial* explanation of the observation — but only partial: a one-frame shift mis-attributes by one frame, so it cannot by itself account for features that stay flat across an entire multi-frame collision window. Whether features align with events *at all*, after this fix, is what Tests 3 and 5 measure.
+
+**Done:** frame–activation drift detected (one-frame semantic offset) and fixed by pre-step capture; multi-message/render drift ruled out across 600 frames; 2 episodes agree.
+
 ## Part VII — Open threads
 
 - Feature importance pipeline (temporal stability + causal importance), as above.

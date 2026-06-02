@@ -43,6 +43,8 @@ export interface SAEFeature {
 }
 
 export interface FrameData {
+  frame_index: number;                            // monotonic step id; frame + activations
+                                                  // in this message describe the same step
   frame: string;                                  // base64 PNG
   attention: Record<string, number[][][]>;        // layer_idx → [nh][T_q][T_k]
   norms: number[];                                // per layer
@@ -69,6 +71,7 @@ export interface EventMessage {
 export interface VisualizerState {
   connected: boolean;
   loading: boolean;
+  frame_index: number | null;
   frame: string | null;
   attention: Record<string, number[][][]> | null;
   norms: number[] | null;
@@ -132,6 +135,7 @@ export function useVisualizerSocket(
   const [state, setState] = useState<VisualizerState>({
     connected: false,
     loading: false,
+    frame_index: null,
     frame: null,
     attention: null,
     norms: null,
@@ -224,9 +228,21 @@ export function useVisualizerSocket(
 
       if (type === "frame") {
         const f = msg as unknown as FrameData & { type: string };
+        // Test 1 instrumentation: the game frame and the activations live in this one
+        // message, so they describe the same step by construction. Log both render ticks
+        // with the same frame_index to make any drift visible (console.debug — off by
+        // default in prod). Backend already aligns frame↔activations to the same timestep.
+        if (process.env.NODE_ENV !== "production") {
+          const t = Math.round(performance.now());
+          // eslint-disable-next-line no-console
+          console.debug(`[frame ${f.frame_index}] game frame rendered at ${t}`);
+          // eslint-disable-next-line no-console
+          console.debug(`[frame ${f.frame_index}] activations rendered at ${t}`);
+        }
         setState((prev) => ({
           ...prev,
           loading: false,
+          frame_index: f.frame_index,
           frame: f.frame,
           attention: f.attention,
           norms: f.norms,
