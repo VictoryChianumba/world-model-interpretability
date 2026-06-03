@@ -1,313 +1,165 @@
-# WM Visualizer
+# World Model Interpretability
 
-Real-time interpretability visualiser for the [IRIS](https://github.com/eloialonso/iris) world model.  A FastAPI backend runs IRIS inference and streams attention weights and residual-stream activation norms to a Next.js frontend over WebSocket — every frame, live, as the agent plays.
+An investigation into **SAE-based interpretability on world models** — specifically [IRIS](https://github.com/eloialonso/iris), a transformer world model trained on Atari. The question driving it: the tooling and conventions that have matured around sparse autoencoders on *language* models are now being imported into other domains; **which of them actually transfer to a world model, and which break?**
+
+The answer, found by building the tooling and then characterizing what went wrong, is that several core conventions don't transfer cleanly. **The findings are the artifact; the interactive tool is the substrate that made them visible.**
+
+> **New here? Start with [`BLOGPOST.md`](BLOGPOST.md)** — the external-facing writeup of what was found and why it matters. For the synthesis report read [`REPORT.md`](REPORT.md); for the project-independent lessons read [`FINDINGS.md`](FINDINGS.md).
 
 ---
 
-## What it does
+## The findings, in one paragraph
 
-| Pane | Content |
+LLM-SAE conventions transfer worse than expected to world models, in ways that are individually subtle and collectively substantial. **Magnitude ranking** — the default discovery sort — surfaces *persistent* features (a ball-tracker that fires throughout the ball's flight, the single most-active feature `#1364`) over *event* features (collision detectors `#1199`/`#120`, which exist and are robust but rank lower), so a user scanning the top of the list for "the collision feature" is shown the wrong thing. **Pixel-space state extraction** fails because the tokenizer drops small objects — the Breakout ball is sub-pixel even in the model's own 64×64 input. **Single-frame-primed rollouts** are near-static (~0.8/255 mean pixel change over 20 frames) because one frame gives position but not velocity. **Argmax decoding** makes intervention response a step function, so the decoder, not the SAE, sets the granularity. **Causal-importance ranking** silently collapses into a magnitude ranking unless you inject magnitude-independently, and even fixed it is too single-state-fragile to rank reproducibly (cross-set Spearman plateaued at +0.49, below the pre-committed 0.6 bar). And the compute lever you'd reach for to fix that doesn't pull: **autoregressive rollouts are CPU-dispatch-bound, not GPU-bound.**
+
+Of three proposed substrate-adapted importance axes, two shipped (magnitude, temporal stability) and one (causal) was demoted to a characterization tool after its confound and single-state fragility were found and measured. Documenting *why* causal didn't make it is the more transferable result.
+
+---
+
+## Documents
+
+| File | What it is |
 |---|---|
-| **Left** | Raw game frame at native resolution (`imageSmoothingEnabled = false`) |
-| **Middle** | Per-head attention heatmap for the selected transformer layer.  Axes are labelled with token types (`o0`…`o15`, `act`) derived from the model config at runtime. |
-| **Right (top)** | Residual-stream activation norm bar chart — one bar per layer, colour-coded by magnitude. |
-| **Right (bottom)** | Live metrics (inference FPS, episode, return, queue depth, hook latency, drop rate) and an event stream (agent loaded, episode start/end, errors, WebSocket reconnects). |
-
-The **layer slider** in the top bar sweeps the attention view across all transformer layers in real time.  The **agent dropdown** switches between available checkpoints without restarting the page.
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────┐       WebSocket /ws          ┌────────────────────────────┐
-│       FastAPI backend        │ ──────────────────────────▶  │    Next.js frontend        │
-│                              │                              │                            │
-│  InferenceEngine             │  JSON frames @ infer rate    │  useVisualizerSocket()     │
-│   └─ background thread       │                              │   ├─ GameFrame (canvas)    │
-│       ├─ agent.act()  ──▶ Atari env                         │   ├─ AttentionHeatmap(visx)│
-│       ├─ world_model() ──▶ hooks fire                       │   ├─ ActivationNorms (visx)│
-│       └─ encode frame (PNG)  │                              │   ├─ ControlBar            │
-│                              │  POST /control               │   └─ LogPane               │
-│  REST: /agents  /config      │ ◀────────────────────────── │                            │
-└──────────────────────────────┘                              └────────────────────────────┘
-```
-
-Hook extraction uses **PyTorch forward hooks only** — no files under `iris/src/` are ever modified.
-
-### Hook targets
-
-| Hook site | Captured tensor | Shape |
-|---|---|---|
-| `block.attn.attn_drop` | `inp[0]` — post-softmax attention before dropout | `(1, nh, T_q, T_k)` |
-| `block` (residual output) | `out[0, -1].norm()` — L2 norm of last token | scalar |
-
-With no KV cache (the strategy used here): `T_q = T_k = tokens_per_block = 17`, giving a consistent `4 × 17 × 17` attention tensor every step.
+| [`BLOGPOST.md`](BLOGPOST.md) | External-facing writeup for interpretability readers — the place to start. |
+| [`REPORT.md`](REPORT.md) | Synthesis report: what was built, the headline result, the clean negative, a process retrospective. |
+| [`FINDINGS.md`](FINDINGS.md) | Transferable, project-independent methodological lessons. |
+| [`WRITEUP.md`](WRITEUP.md) | The detailed running log / audit trail — every number, test, and case study. |
+| [`STORY.md`](STORY.md) | The narrative arc, short form. |
+| [`CLAUDE.md`](CLAUDE.md) | Developer-facing architecture, data flow, and design decisions. |
 
 ---
 
-## Project structure
+## The tool (the substrate)
+
+A FastAPI backend runs IRIS inference and extracts residual-stream activations through PyTorch forward hooks; a trained SAE turns those into features; a Next.js frontend lets you discover, pin, label, and **intervene** on features and watch the model's imagined rollout diverge.
+
+The current UI (`frontend/`, **v2**) is a **canvas of pinned feature cards**:
+
+- **Canvas of feature cards** (react-konva) — each card is a feature with a sparkline, an editable label, and an intervention-scale slider; layout is persisted server-side so a working set survives reloads.
+- **Search-first discovery** — jump to a feature by id or label; a side discovery panel ranks candidates by **firing magnitude** or **temporal stability** (the two axes that survived).
+- **Multi-feature intervention** — non-zero-scale cards jointly steer a paused, N-step imagined rollout; the rollout sums their directions, so steering N features costs the same as one.
+- **N-step imagined rollouts** — baseline vs. intervened frames with a **token-divergence trajectory** beneath (the load-bearing measurement, since pixel-space object extraction is unreliable on this substrate).
+- **Model Internals tab** (hidden by default) — the original attention heatmaps and residual-norm bars, demoted once feature intervention became the workflow.
+
+The SAE is a plain **ReLU/L1** sparse autoencoder trained on layer-5 residual-stream activations from Breakout (`d_in=256`, `d_hidden=2048`, `l1_coeff=2.0`, L0 ≈ 14–15). The legacy v1 panel-grid UI is preserved and runnable at `frontend-v1/`; both connect to the same backend.
+
+IRIS source (`iris/src/`) is **never modified** — it is added to `sys.path` and driven through hooks and its own imagination path.
+
+---
+
+## Results & research artifacts
+
+- **`results/`** — the feature-characterization diagnostic battery: frame/activation sync (`test1`), extraction determinism (`test2`), collision correlation (`test3`), and per-event timing traces (`test5`, with plots). These are what resolved the apparent feature–event "decoupling."
+- **`data/`** — the fixed-norm causal-importance runs behind the demotion decision (two disjoint 18-state sets, A and B). See [`data/README.md`](data/README.md). **Research artifacts, not a shipped feature.**
+- **`deploy/`** — RunPod cloud-GPU scaffold used for the (ultimately dispatch-bound) causal run.
+
+---
+
+## Repo structure
 
 ```
 world-model-interpretability/
+├── BLOGPOST.md  REPORT.md  FINDINGS.md  WRITEUP.md  STORY.md   # the writeups
 ├── backend/
-│   ├── hooks.py          # IrisHookExtractor — forward hook registration / teardown
-│   ├── inference.py      # InferenceEngine — background thread, bounded queue, frame encoding
-│   ├── main.py           # FastAPI app — WebSocket /ws, REST /agents /config /control
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── layout.tsx
-│   │   │   └── page.tsx
-│   │   ├── components/
-│   │   │   ├── GameFrame.tsx          # canvas, imageSmoothingEnabled=false
-│   │   │   ├── AttentionHeatmap.tsx   # visx heatmap, token-labelled axes
-│   │   │   ├── ActivationNorms.tsx    # visx bar chart
-│   │   │   ├── ControlBar.tsx         # agent/layer controls, connection status
-│   │   │   ├── LogPane.tsx            # metrics + event stream
-│   │   │   └── MorphingGraph.tsx      # D3 placeholder (scaffold)
-│   │   └── hooks/
-│   │       └── useVisualizerSocket.ts # WebSocket lifecycle, auto-reconnect
-│   ├── src/__tests__/
-│   │   └── useVisualizerSocket.test.ts
-│   ├── package.json
-│   └── Dockerfile
-├── tests/
-│   └── test_backend.py
-├── docker-compose.yml
-└── README.md             ← you are here
+│   ├── hooks.py            # IrisHookExtractor — forward hooks on the WM residual stream
+│   ├── inference.py        # InferenceEngine — background thread, queues, SAE, rollouts, stability ranking
+│   ├── main.py             # FastAPI app — /ws, /rollout, /pinned, /feature, /ranking/*, /control
+│   ├── sae.py              # ReLU/L1 SparseAutoencoder
+│   ├── pinned.py           # v2 canvas state store
+│   ├── ranking_store.py    # causal-importance score store (characterization tool)
+│   ├── autointerp_store.py # vision-LLM feature-label cache (built, not run by default)
+│   ├── bookmarks.py  state_extract.py
+│   └── scripts/
+│       ├── train_sae.py            # SAE training pipeline
+│       ├── causal_importance.py    # offline causal scoring (fixed-norm injection)
+│       ├── autointerp.py  analyze_sae.py  collect_episodes.py  label_features.py
+│       └── diagnostics/            # the feature-characterization test battery (test1/2/3/5)
+├── frontend/        # v2 — canvas of pinned feature cards (react-konva), discovery, rollout
+├── frontend-v1/     # legacy v1 panel-grid UI (runnable fallback)
+├── results/  data/  deploy/        # diagnostic outputs, causal artifacts, cloud scaffold
+├── tests/           # test_backend.py, test_sae.py, test_visualizer.py
+├── visualizer.py    # separate standalone Ha & Schmidhuber WM viewer (not the IRIS work)
+└── docker-compose.yml
 ```
 
 ---
 
-## WebSocket message schema
-
-### Frame message (every inference step)
-
-```jsonc
-{
-  "type": "frame",
-  "frame": "<base64 PNG>",          // raw game frame — before any preprocessing
-  "attention": {
-    "0": [[[…]]],                   // layer_idx → [num_heads][T_q][T_k]
-    "1": [[[…]]],
-    "9": [[[…]]]
-  },
-  "norms": [1.2, 3.4, …],          // L2 norm of last residual token, one per layer
-  "metrics": {
-    "infer_fps": 14.8,
-    "step": 42,
-    "episode": 3,
-    "queue_depth": 1,
-    "hook_latency_ms": 2.1,
-    "drop_rate": 0.0,
-    "return": 120.0
-  },
-  "token_layout": {
-    "tokens_per_block": 17,
-    "obs_per_block": 16,
-    "labels": ["o0", "o1", …, "o15", "act"]  // derived from model config at runtime
-  }
-}
-```
-
-### Event messages (interleaved)
-
-```jsonc
-{ "type": "event", "event": "agent_loaded",  "data": { "agent": "Breakout", "layers": 10, "heads": 4 } }
-{ "type": "event", "event": "episode_start", "data": { "episode": 1 } }
-{ "type": "event", "event": "episode_end",   "data": { "episode": 1, "return": 42.0, "steps": 1700 } }
-{ "type": "event", "event": "error",         "data": { "message": "…" } }
-```
-
-### Config message (sent once on connect)
-
-```jsonc
-{
-  "type": "config",
-  "num_layers": 10, "num_heads": 4, "embed_dim": 256,
-  "tokens_per_block": 17, "max_blocks": 20,
-  "agents": [
-    { "id": "Breakout", "name": "Breakout",
-      "path": "/abs/Breakout.pt", "env_id": "BreakoutNoFrameskip-v4" }
-  ]
-}
-```
-
----
-
-## Local development setup
+## Running it
 
 ### Prerequisites
 
-- Python 3.10 with IRIS venv already set up (`iris/.venv310`)
+- Python 3.10 with the IRIS venv set up (`iris/.venv310`)
 - Node.js 20+
-- IRIS checkpoints in `iris/checkpoints/` (e.g. `Breakout.pt`, `Alien.pt`)
+- IRIS checkpoints in `iris/checkpoints/` (e.g. `Breakout.pt`) and a trained SAE (`sae_L5.pt`)
 - Atari ROMs installed: `ale-import-roms /path/to/roms/`
 
-### 1. Backend
+### Backend
 
 ```bash
 cd world-model-interpretability/backend
-
-# Option A: reuse iris/.venv310 (all deps already installed)
-/path/to/iris/.venv310/bin/pip install fastapi uvicorn[standard] websockets
-
-# Option B: fresh venv
-python3.10 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Set env vars and start
 export IRIS_ROOT=/Users/temp/Desktop/projects/world_models/iris
 export IRIS_SRC=$IRIS_ROOT/src
 export CHECKPOINT_DIR=$IRIS_ROOT/checkpoints
-
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 2. Frontend
+Set `DEFAULT_DEVICE=mps` (or `cuda`) to use an accelerator; the activation-harvest path gets ~2× on MPS over CPU.
+
+### Frontend
 
 ```bash
-cd world-model-interpretability/frontend
+cd world-model-interpretability/frontend   # or frontend-v1/ for the legacy UI
 npm install
 npm run dev        # → http://localhost:3000
 ```
 
-Open `http://localhost:3000`.  REST calls are proxied to `http://localhost:8000` via the Next.js rewrite in `next.config.js`.
+REST calls are proxied to `http://localhost:8000` via the Next.js rewrite in `next.config.js`.
 
-### 3. Running tests
-
-**Backend:**
+### Tests
 
 ```bash
-cd world-model-interpretability
-IRIS_ROOT=/path/to/iris \
-  /path/to/iris/.venv310/bin/pytest tests/test_backend.py -v
+# Backend (from repo root)
+IRIS_ROOT=/path/to/iris /path/to/iris/.venv310/bin/pytest tests/test_backend.py -v
+
+# Frontend
+cd frontend && npm test -- --watchAll=false
 ```
 
-**Frontend:**
+### Docker
 
 ```bash
-cd world-model-interpretability/frontend
-npm test
+docker-compose up --build   # backend → :8000, frontend → :3000
 ```
+
+`docker-compose.yml` mounts the IRIS repo as a **read-only** volume; nothing under `iris/src/` is ever written.
 
 ---
 
-## How to run locally (short form)
+## Training an SAE / regenerating artifacts
 
 ```bash
-# Terminal 1 — backend
-cd world-model-interpretability/backend
-IRIS_ROOT=../../iris uvicorn main:app --port 8000
+# Train a layer-5 SAE on harvested Breakout activations
+python backend/scripts/train_sae.py \
+  --episodes-dir <iris>/outputs/.../media/episodes/test \
+  --checkpoint <iris>/checkpoints/Breakout.pt \
+  --layers 5 --expansion 8 --l1 2.0 --out-dir <iris>/checkpoints
 
-# Terminal 2 — frontend
-cd world-model-interpretability/frontend
-npm run dev
+# Causal-importance characterization (CPU-dispatch-bound — a bigger GPU barely helps; batch the rollouts)
+python backend/scripts/causal_importance.py --checkpoint <iris>/checkpoints/Breakout.pt \
+  --sae <iris>/checkpoints/sae_L5.pt --fixed-norm \
+  --features-file results/causal_candidate_ids.json \
+  --seeds 18 --state-stride 30 --n-steps 10 --scale 5 --device cuda
 ```
 
 ---
 
-## Docker deployment
+## Limitations
 
-```bash
-# from world-model-interpretability/
-docker-compose up --build
-```
+These are observations from one substrate, **not laws**:
 
-- Backend → `http://localhost:8000`
-- Frontend → `http://localhost:3000`
-
-`docker-compose.yml` mounts the IRIS repo as a **read-only** volume at `/iris`.  Nothing under `iris/src/` is ever written.
-
-### Changing the IRIS mount path
-
-Edit `docker-compose.yml` → `services.backend.volumes`:
-
-```yaml
-volumes:
-  - /your/iris/path:/iris:ro
-```
-
----
-
-## How to add new agents
-
-1. Drop a `.pt` checkpoint file into `iris/checkpoints/`.
-2. The file stem becomes the agent name shown in the dropdown.
-3. The Atari env ID is inferred automatically — `Breakout.pt` → `BreakoutNoFrameskip-v4`.
-4. For non-standard names add an entry to `_KNOWN_ENV_IDS` in `backend/main.py`.
-5. Refresh the browser — the new agent appears immediately (list fetched on each WS connect from `GET /agents`).
-
----
-
-## Switching agents and games during a session
-
-**Via the UI:** select a new agent in the dropdown.  The frontend clears the current visualisation instantly and shows a loading spinner; the backend simultaneously stops the inference thread, flushes the queue, detaches old hooks, loads the new checkpoint, attaches fresh hooks, and restarts — within a single `POST /control` call.
-
-**Via REST:**
-
-```bash
-curl -X POST http://localhost:8000/control \
-  -H 'Content-Type: application/json' \
-  -d '{"command":"switch_agent","payload":{
-        "checkpoint_path":"/iris/checkpoints/Alien.pt",
-        "env_id":"AlienNoFrameskip-v4"}}'
-```
-
-**Other controls:**
-
-| `command` | `payload` | Effect |
-|---|---|---|
-| `restart` | — | Reset current episode |
-| `pause` | — | Halt inference (queue stops filling) |
-| `resume` | — | Continue inference |
-| `loop` | `{"enabled": true\|false}` | Toggle episode looping |
-| `switch_agent` | `{"checkpoint_path":…, "env_id":…}` | Hot-swap agent |
-
----
-
-## How to read the visualisations
-
-### Attention heatmap (middle pane)
-
-- **Grid:** one subplot per head.  4 heads → 2 × 2 grid.
-- **Axes:** rows = query tokens (attending *from*), columns = key tokens (attending *to*).  Labels come from `token_layout.labels` in the WebSocket message — `o0`…`o15` are VQVAE image tokens, `act` is the action token.
-- **Colour:** dark blue = low attention, bright indigo = high attention.
-- **Layer slider:** sweep through 0 → num_layers − 1.  Early layers tend to attend locally; later layers show longer-range patterns and inter-token mixing.
-- The diagonal of the causal mask is visible at the bottom-left corner for observation tokens.
-
-### Activation norm chart (right-top pane)
-
-- **X-axis:** transformer layer index (0 = first).
-- **Y-axis:** L2 norm of the residual stream at the last token after each block.
-- **Colour:** plasma scale — brighter = larger norm.
-- Layers with tall bars are doing the most computation for the current token; near-zero layers have little effect.
-
----
-
-## Log file location and structure
-
-The backend logs to stdout.  To persist:
-
-```bash
-uvicorn main:app --port 8000 2>&1 | tee world-model-interpretability.log
-```
-
-Format: `YYYY-MM-DD HH:MM:SS [LEVEL] module: message`
-
-Hook latency warnings are emitted at `WARNING` level when extraction exceeds 10 ms.
-
----
-
-## Known limitations
-
-- **Single WebSocket client:** the engine is a singleton; a second browser tab shares the same inference loop.
-- **No KV cache in WM forward:** hook extraction uses a fresh single-block pass (no KV cache) each step — consistent 17 × 17 attention, but does not reflect the model's true autoregressive context.
-- **CPU-only default:** set `DEFAULT_DEVICE=mps` or `cuda` to use accelerators; MPS is untested with IRIS models.
-- **Frame dropping:** when the browser renders slower than inference, frames are silently dropped; monitor `drop_rate` in the log pane.
-- **Atari ROMs:** must be installed separately before first run.
-- **D3 morphing graph:** scaffolded as a placeholder in `MorphingGraph.tsx`; implementation pending.
+- **One game, one model** — Breakout on IRIS only; no cross-game or cross-model replication. The SAE is trained at a single layer (5).
+- **Small SAE** — 2048 features from ~80k vectors (~5k frames); on the low side of the sample-to-feature ratio for clean recovery.
+- **No architecture bake-off** — one plain ReLU/L1 SAE, not a comparison across SAE variants.
+- **Autointerp labels** are built but not run by default, so most features show "unlabeled" (the "stability beats magnitude" claim rests on a collision-correlation proxy, not read labels).
+- **Causal importance** is a *not-yet* as much as a *no* — below the robustness bar at the state counts that were affordable; batched rollouts might clear it.
+- **Tooling caveats** — single shared engine instance across browser tabs; no KV cache in the hook-extraction pass (attention is always 17×17, not the true autoregressive context); single-frame-primed rollouts are near-static; frames are dropped (not queued) when the consumer falls behind (`drop_rate`).
