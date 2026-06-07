@@ -4,7 +4,7 @@ An investigation into **SAE-based interpretability on world models** — specifi
 
 The answer, found by building the tooling and then characterizing what went wrong, is that several core conventions don't transfer cleanly. **The findings are the artifact; the interactive tool is the substrate that made them visible.**
 
-> **New here? Start with [`BLOGPOST.md`](BLOGPOST.md)** — the external-facing writeup of what was found and why it matters. For the synthesis report read [`REPORT.md`](REPORT.md); for the project-independent lessons read [`FINDINGS.md`](FINDINGS.md).
+> **New here? Start with [`REPORT.md`](REPORT.md)** — the synthesis of what was built, the headline result, and the clean negative. For the project-independent lessons read [`FINDINGS.md`](FINDINGS.md).
 
 ---
 
@@ -20,11 +20,8 @@ Of three proposed substrate-adapted importance axes, two shipped (magnitude, tem
 
 | File | What it is |
 |---|---|
-| [`BLOGPOST.md`](BLOGPOST.md) | External-facing writeup for interpretability readers — the place to start. |
-| [`REPORT.md`](REPORT.md) | Synthesis report: what was built, the headline result, the clean negative, a process retrospective. |
+| [`REPORT.md`](REPORT.md) | Synthesis report: what was built, the headline result, the clean negative, a process retrospective — the place to start. |
 | [`FINDINGS.md`](FINDINGS.md) | Transferable, project-independent methodological lessons. |
-| [`WRITEUP.md`](WRITEUP.md) | The detailed running log / audit trail — every number, test, and case study. |
-| [`STORY.md`](STORY.md) | The narrative arc, short form. |
 | [`CLAUDE.md`](CLAUDE.md) | Developer-facing architecture, data flow, and design decisions. |
 
 ---
@@ -59,7 +56,7 @@ IRIS source (`iris/src/`) is **never modified** — it is added to `sys.path` an
 
 ```
 world-model-interpretability/
-├── BLOGPOST.md  REPORT.md  FINDINGS.md  WRITEUP.md  STORY.md   # the writeups
+├── REPORT.md  FINDINGS.md          # the writeups
 ├── backend/
 │   ├── hooks.py            # IrisHookExtractor — forward hooks on the WM residual stream
 │   ├── inference.py        # InferenceEngine — background thread, queues, SAE, rollouts, stability ranking

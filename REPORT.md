@@ -1,8 +1,7 @@
 # WM Visualizer — interpretability tooling and feature-importance findings for an IRIS world model
 
-*A synthesis report. The detailed running log is [WRITEUP.md](WRITEUP.md); the narrative arc is
-[STORY.md](STORY.md); the transferable, project-independent lessons are [FINDINGS.md](FINDINGS.md).
-This document ties them together and is honest about both the results and the process.*
+*A synthesis report. The transferable, project-independent lessons are in [FINDINGS.md](FINDINGS.md).
+This document ties the work together and is honest about both the results and the process.*
 
 ## Abstract
 

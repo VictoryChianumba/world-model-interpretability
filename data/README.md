@@ -3,9 +3,8 @@
 These are **research artifacts, not a shipped feature**. Causal importance was investigated
 as a third discovery-panel ranking and **deliberately not integrated** — fixed-norm causal
 importance reached only cross-set Spearman ≈ 0.49 (below the pre-committed 0.6 bar), so it is
-not reproducible enough to rank features in the UI. See `WRITEUP.md` Part VI, "Causal
-importance, revisited," for the full story (magnitude confound → single-state limitation →
-robustness plateau → decision). The pipeline survives as a *characterization* tool
+not reproducible enough to rank features in the UI. See `REPORT.md` §4 ("Clean negative result")
+for the full story (magnitude confound → single-state limitation → robustness plateau → decision). The pipeline survives as a *characterization* tool
 (`backend/scripts/causal_importance.py` + the `/feature/{id}` endpoint).
 
 > The earlier `causal_L5.json` (a 2048-feature **magnitude-relative** run) was removed: it was
