@@ -45,3 +45,9 @@ sae_runs/
 
 # Harness transient
 .claude/scheduled_tasks.lock
+
+# Private drafts / internal-facing docs (kept local, not published to the repo)
+BLOGPOST.md
+BLOGPOST.v1.md
+WRITEUP.md
+STORY.md
